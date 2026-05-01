@@ -16,15 +16,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _exception_signature(exc: BaseException) -> str:
+    """Stable, single-line key identifying an exception for dedup/backoff.
+
+    Uses the exception type plus the first line of the message, truncated.
+    Two crashes that differ only in trailing detail (e.g. a session id)
+    still collapse to the same signature.
+    """
+    msg = str(exc).splitlines()[0] if str(exc) else ""
+    return f"{type(exc).__name__}:{msg[:160]}"
+
+
 class WorkerSupervisor:
     """Wraps a pooled worker agent in a reconnect-forever loop.
 
     Every cycle: increment session count, optionally rebuild recovery context
     (git log + uncommitted changes + TASK.md), create a fresh agent, run it.
-    Both crashes and clean exits from ``agent.run()`` trigger another cycle
-    after ``restart_delay_seconds``. The loop only ends when the enclosing
-    task is cancelled (via the runner's shutdown path).
+    Both crashes and clean exits from ``agent.run()`` trigger another cycle.
+    The loop only ends when the enclosing task is cancelled (via the runner's
+    shutdown path).
+
+    Backoff: when consecutive cycles share the same exit signature (same
+    crash type+message, or repeated clean-exit churn) the delay doubles up
+    to ``_MAX_BACKOFF_SECONDS``. Different signatures reset the counter.
+    Tracebacks for repeat failures are suppressed so a deterministic loop
+    (missing worktree, missing CLI binary) doesn't flood stdout.
     """
+
+    _MAX_BACKOFF_SECONDS = 60.0
+    _MAX_BACKOFF_DOUBLINGS = 6  # 2**6 = 64 → clamped to 60s
 
     def __init__(
         self,
@@ -44,6 +64,19 @@ class WorkerSupervisor:
         self._worktree_path = worktree_path
         self._restart_delay = restart_delay_seconds
         self._activity = activity
+
+    def _compute_backoff(self, consecutive_same: int) -> float:
+        """Exponential backoff capped at ``_MAX_BACKOFF_SECONDS``.
+
+        ``consecutive_same`` is 0 for the first occurrence of a signature
+        and increments for each repeat. With ``restart_delay_seconds=0``
+        (test mode) the backoff stays 0 so existing fast tests don't slow
+        down.
+        """
+        if self._restart_delay <= 0:
+            return 0.0
+        doublings = min(consecutive_same, self._MAX_BACKOFF_DOUBLINGS)
+        return min(self._MAX_BACKOFF_SECONDS, self._restart_delay * (2 ** doublings))
 
     def _load_assignment_state(self) -> dict:
         """Load assignment state from .codeband_state.json in worktree.
@@ -81,6 +114,10 @@ class WorkerSupervisor:
                 worktree_path=str(self._worktree_path),
             )
 
+        last_exit_signature: str | None = None
+        consecutive_same: int = 0
+        last_recovery_signature: str | None = None
+
         while True:
             identity.session_count += 1
 
@@ -92,11 +129,19 @@ class WorkerSupervisor:
                         self._worker_id, self._worktree_path, identity,
                         assignment=assignment,
                     )
-                except Exception:
-                    logger.warning(
-                        "Failed to build recovery context for %s", self._worker_id,
-                        exc_info=True,
-                    )
+                except Exception as exc:
+                    sig = _exception_signature(exc)
+                    if sig == last_recovery_signature:
+                        logger.warning(
+                            "Failed to build recovery context for %s "
+                            "(repeat: %s)", self._worker_id, sig,
+                        )
+                    else:
+                        last_recovery_signature = sig
+                        logger.warning(
+                            "Failed to build recovery context for %s",
+                            self._worker_id, exc_info=True,
+                        )
 
             identity.save(self._state_dir)
             if self._activity:
@@ -107,9 +152,11 @@ class WorkerSupervisor:
             agent = await self._create_agent_fn(recovery_context=recovery_context)
 
             exit_reason: str
+            exit_signature: str
             try:
                 await agent.run()
                 exit_reason = "clean_exit"
+                exit_signature = "clean_exit"
             except asyncio.CancelledError:
                 await self._close_agent(agent)
                 raise
@@ -117,6 +164,7 @@ class WorkerSupervisor:
                 identity.last_session_error = str(exc)
                 identity.save(self._state_dir)
                 exit_reason = f"crash: {type(exc).__name__}: {exc}"
+                exit_signature = f"crash:{_exception_signature(exc)}"
                 if self._activity:
                     self._activity.log(
                         "SESSION_CRASH", self._worker_id,
@@ -128,6 +176,13 @@ class WorkerSupervisor:
             # on non-cancellation paths.
             await self._close_agent(agent)
 
+            if exit_signature == last_exit_signature:
+                consecutive_same += 1
+            else:
+                last_exit_signature = exit_signature
+                consecutive_same = 0
+            delay = self._compute_backoff(consecutive_same)
+
             if self._activity:
                 self._activity.log(
                     "SESSION_RESTART", self._worker_id,
@@ -137,9 +192,9 @@ class WorkerSupervisor:
             logger.warning(
                 "Worker %s session %d ended (%s). Restarting in %.1fs...",
                 self._worker_id, identity.session_count,
-                exit_reason, self._restart_delay,
+                exit_reason, delay,
             )
-            await asyncio.sleep(self._restart_delay)
+            await asyncio.sleep(delay)
 
     async def _close_agent(self, agent: Any) -> None:
         """Best-effort SDK teardown between worker restart cycles."""

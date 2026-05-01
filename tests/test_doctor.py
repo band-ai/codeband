@@ -30,6 +30,7 @@ from codeband.doctor import (
     check_codeband_yaml,
     check_codex_auth,
     check_codex_cli,
+    check_cross_model_pairing,
     check_gh,
     check_gh_auth,
     check_git,
@@ -239,6 +240,33 @@ class TestAgentConfig:
         ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
         result = check_agent_config_yaml(ctx)
         assert result.status == Status.OK
+
+
+class TestCrossModelPairing:
+    def test_warns_when_reviewer_capacity_below_coder_capacity(self, tmp_path):
+        cfg = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/example/repo.git"),
+            workspace=WorkspaceConfig(path=str(tmp_path / "workspace")),
+            band=BandConfig(),
+            agents=AgentsConfig(
+                coders=FrameworkPool(
+                    claude_sdk=PoolEntry(count=2),
+                    codex=PoolEntry(count=0),
+                ),
+                reviewers=ReviewersConfig(
+                    claude_sdk=PoolEntry(count=0),
+                    codex=PoolEntry(count=1),
+                ),
+                planners=FrameworkPool(claude_sdk=PoolEntry(count=1)),
+                plan_reviewers=PlanReviewersConfig(codex=PoolEntry(count=1)),
+            ),
+        )
+
+        result = check_cross_model_pairing(Context(project_dir=tmp_path, config=cfg))
+
+        assert result.status == Status.WARN
+        assert "2 claude_sdk authors share 1 codex reviewers" in result.message
+        assert "reviewer capacity" in result.remediation
 
 
 class TestWorkspace:

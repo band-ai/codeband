@@ -359,14 +359,16 @@ def check_cross_model_pairing(ctx: Context) -> CheckResult:
     Adversarial diversity is the primary benefit of multi-model Codeband.
     If every coder shares a framework with the only active reviewer
     framework (or planner/plan-reviewer do), cross-model review
-    degrades to same-model — which LLM-as-judge research shows has
-    high self-preference bias.
+    degrades to same-model. Also warn when opposite-framework reviewer
+    capacity is lower than author capacity, because deterministic prompt
+    pairing will make multiple authors share a reviewer slot.
     """
     if ctx.config is None:
         return CheckResult(Status.SKIP, "codeband.yaml not loaded")
 
     agents = ctx.config.agents
     issues: list[str] = []
+    capacity_issues: list[str] = []
 
     def _check_pair(label: str, author_pool, critic_pool) -> None:
         author_fws = set(author_pool.active_frameworks())
@@ -378,17 +380,30 @@ def check_cross_model_pairing(ctx: Context) -> CheckResult:
         if len(critic_fws) == 1 and critic_fws <= author_fws:
             only = next(iter(critic_fws))
             issues.append(f"{label}: only {only.value} available → same-model review")
+            return
+
+        for fw in author_fws:
+            author_count = author_pool.entry_for(fw).count
+            opposite = Framework.CODEX if fw == Framework.CLAUDE_SDK else Framework.CLAUDE_SDK
+            critic_count = critic_pool.entry_for(opposite).count
+            if critic_count > 0 and author_count > critic_count:
+                capacity_issues.append(
+                    f"{label}: {author_count} {fw.value} authors share "
+                    f"{critic_count} {opposite.value} reviewers",
+                )
 
     _check_pair("Planner/Plan Reviewer", agents.planners, agents.plan_reviewers)
     _check_pair("Coder/Code Reviewer", agents.coders, agents.reviewers)
 
-    if issues:
+    all_issues = issues + capacity_issues
+    if all_issues:
         return CheckResult(
             Status.WARN,
-            "Cross-model pairing unavailable: " + "; ".join(issues),
+            "Cross-model pairing constrained: " + "; ".join(all_issues),
             remediation=(
-                "For adversarial review, enable both frameworks in the relevant "
-                "pool — e.g. `cb scale reviewers.codex=1` for a Codex code reviewer."
+                "For adversarial review, enable opposite-framework reviewers and "
+                "keep reviewer capacity at least as large as matching author "
+                "capacity — e.g. `cb scale reviewers.codex=2` for two Claude coders."
             ),
         )
     return CheckResult(Status.OK, "Cross-model pairing possible for all pools")

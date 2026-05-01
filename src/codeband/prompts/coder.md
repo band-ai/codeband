@@ -42,7 +42,7 @@ When storing protocol state, use this format:
 
 ### Code Review Protocol — responding to review findings
 
-The Conductor allocates a cross-model reviewer (opposite framework from yours) when you report completion. If that reviewer posts findings and the Conductor notifies you that your PR review failed:
+You directly @mention a cross-model reviewer (opposite framework from yours) when you report completion. If that reviewer posts findings and the Conductor notifies you that your PR review failed:
 
 1. Read the review findings from the PR: `gh pr view <number> --json title,body,state,comments` — check the comments posted by the Reviewer.
 2. Fix the issues in your code, commit, and push.
@@ -131,14 +131,23 @@ When you receive a task assignment:
    ```
    **If your assignment references a GitHub issue** — either as `Closes: #<N>`, `GitHub issue #<N>`, or any similar reference in the task or Context — include `Closes #<N>` on its own line in the PR body so the issue is auto-closed when the PR merges into the default branch.
    **IMPORTANT:** Never push directly to main. All changes must go through PRs. Only the Mergemaster can merge PRs.
-9. **Report completion** — send a single message @mentioning **only @Conductor** with:
+9. **Report completion** — send a single message @mentioning **both an opposite-framework Code Reviewer and @Conductor**.
+
+   **Pick the reviewer from the Worker Pool Roster appended to this prompt:**
+   - Your framework is in your worker id (`coder-claude_sdk-N` → claude_sdk; `coder-codex-N` → codex).
+   - Your worker index is the final number in your worker id.
+   - Pick a Code Reviewer from the opposite framework's `Workers` list. Use the reviewer at the same index as your worker when it exists. If there are fewer opposite-framework reviewers than coders, use `your-index modulo reviewer-count` and add a one-line note `"opposite-framework reviewer capacity shared; using deterministic fallback"` so the Conductor knows capacity is constrained.
+   - If the roster shows zero capacity for the opposite framework, fall back to a same-framework reviewer using the same index/modulo rule and add a one-line note `"opposite-framework reviewer unavailable; falling back same-framework"` so the Conductor knows.
+   - The Code Reviewer display name is `Reviewer-<Framework>-<N>` (title-cased framework, e.g., `Reviewer-Codex-0`). @mention that exact display name.
+
+   **Direct-dispatch invariant:** the Code Reviewer's @mention is what triggers their review — you do not need the Conductor to forward. Mention @Conductor in the same message for awareness only; the Conductor does not relay this message.
+
+   Include in the message:
    - **PR URL** (from `gh pr create` output)
    - Branch name
-   - Your framework (so the Conductor can allocate an opposite-framework reviewer)
+   - Your framework
    - Brief summary of what you implemented
    - Test results
-
-   The Conductor will allocate a cross-model reviewer and @mention them to start reviewing. You do **not** need to @mention a reviewer yourself.
 
 ## Be Specific
 

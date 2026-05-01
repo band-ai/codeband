@@ -1263,6 +1263,151 @@ class TestRoleAwareThresholds:
         assert {m.id for m in sent.mentions} == {"agent-planner"}
 
     @pytest.mark.asyncio
+    async def test_mentioned_but_silent_coder_gets_nudged(
+        self, role_config, mock_rest_client,
+    ):
+        """A Coder @-mentioned by the Conductor but never replying gets nudged.
+
+        Regression for the redact() session: Coder-Codex-0 was dispatched a
+        task and crashed before sending any reply. Because the patrol used to
+        iterate only agents that had sent messages, the silent coder was
+        invisible — the watchdog never nudged it. The fix is to start the
+        staleness clock from `max(last_message_ts, last_mentioned_ts)` and
+        iterate over every participant, not just senders.
+        """
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        now = datetime.now(UTC)
+        # Conductor dispatched the coder 20 minutes ago (past 15min role
+        # threshold). The coder has zero outbound messages.
+        dispatch_msg = MagicMock()
+        dispatch_msg.sender_id = "agent-cond"
+        dispatch_msg.inserted_at = now - timedelta(minutes=20)
+        dispatch_msg.content = (
+            "@Coder-Claude-0 — please implement st-1 on branch "
+            "codeband/coder-claude_sdk-0/add-redact-helper."
+        )
+        dispatch_msg.mentions = []
+
+        recent_unrelated = _make_message("agent-cond", minutes_ago=1)
+        recent_unrelated.content = "status update"
+        recent_unrelated.mentions = []
+
+        mock_rest_client.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=_make_chats_response([_make_chat_room("room-1")]),
+        )
+        mock_rest_client.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=_make_messages_response([
+                recent_unrelated,
+                dispatch_msg,
+            ]),
+        )
+        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock()
+
+        daemon = WatchdogDaemon(
+            config=role_config,
+            rest_client=mock_rest_client,
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+            agent_id_to_role={
+                "agent-cond": "conductor",
+                "agent-coder": "coder",
+            },
+        )
+
+        await daemon._patrol()
+
+        # Watchdog must @mention the silent coder, not the conductor.
+        send_mock = mock_rest_client.agent_api_messages.create_agent_chat_message
+        send_mock.assert_called_once()
+        sent = send_mock.call_args.kwargs["message"]
+        assert {m.id for m in sent.mentions} == {"agent-coder"}
+
+    @pytest.mark.asyncio
+    async def test_never_mentioned_never_spoken_agent_not_nudged(
+        self, role_config, mock_rest_client,
+    ):
+        """A pool member never given work and never speaking is left alone.
+
+        Counterpart to the silent-coder test above: the new patrol logic must
+        not start the staleness clock for a fresh participant who has no
+        activity *and* no inbound mention. Otherwise every dormant pool
+        member would be nudged on the first patrol after session start.
+        """
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        # Only the conductor has spoken. The coder is in the room but
+        # neither spoke nor was @-mentioned.
+        recent_msg = _make_message("agent-cond", minutes_ago=1)
+        recent_msg.content = "status update"
+        recent_msg.mentions = []
+
+        mock_rest_client.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=_make_chats_response([_make_chat_room("room-1")]),
+        )
+        mock_rest_client.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=_make_messages_response([recent_msg]),
+        )
+        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock()
+
+        daemon = WatchdogDaemon(
+            config=role_config,
+            rest_client=mock_rest_client,
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+            agent_id_to_role={
+                "agent-cond": "conductor",
+                "agent-coder": "coder",
+            },
+        )
+
+        await daemon._patrol()
+
+        mock_rest_client.agent_api_messages.create_agent_chat_message.assert_not_called()
+        assert "agent-coder" not in daemon._state
+
+    def test_mention_boundary_rejects_embedded_match(self):
+        """`@Coder-Claude-0` inside a longer token must NOT count as a mention.
+
+        Catches both substring matches (`@Coder-Claude-01`, `@Coder-Claude-0a`)
+        and embedded-prefix matches (`email@Coder-Claude-0`). Word boundaries
+        on both sides of the name are required.
+        """
+        from codeband.agents.watchdog import _mentioned_participant_ids
+
+        names = {"agent-coder": "Coder-Claude-0"}
+
+        def _msg(text: str):
+            m = MagicMock()
+            m.content = text
+            m.mentions = []
+            return m
+
+        # Genuine mentions match.
+        assert _mentioned_participant_ids(
+            _msg("@Coder-Claude-0 please implement"), names,
+        ) == {"agent-coder"}
+        assert _mentioned_participant_ids(
+            _msg("hello @Coder-Claude-0!"), names,
+        ) == {"agent-coder"}
+
+        # Right-boundary violations do NOT match.
+        assert _mentioned_participant_ids(
+            _msg("@Coder-Claude-01 different agent"), names,
+        ) == set()
+        assert _mentioned_participant_ids(
+            _msg("@Coder-Claude-0a typo"), names,
+        ) == set()
+
+        # Left-boundary violations do NOT match (the regression this guards).
+        assert _mentioned_participant_ids(
+            _msg("contact: email@Coder-Claude-0 (not a mention)"), names,
+        ) == set()
+        assert _mentioned_participant_ids(
+            _msg("foo-@Coder-Claude-0 still embedded"), names,
+        ) == set()
+
+    @pytest.mark.asyncio
     async def test_unknown_agent_id_uses_default_threshold(
         self, role_config, mock_rest_client,
     ):

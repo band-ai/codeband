@@ -176,6 +176,24 @@ class TestBuildRecoveryContext:
         assert "session" in context.lower()
         assert "coder-claude_sdk-0" in context
 
+    def test_returns_none_when_worktree_missing(self, tmp_path: Path):
+        """If the worktree directory is gone (e.g. recreate failed mid-flight),
+        return None instead of letting subprocess raise FileNotFoundError.
+
+        Regression: previously the supervisor caught the FileNotFoundError but
+        logged a 30-line traceback every restart cycle, flooding stdout.
+        """
+        from codeband.session.context import build_recovery_context
+
+        missing = tmp_path / "does-not-exist"
+        identity = WorkerIdentity(
+            worker_id="coder-codex-0",
+            agent_id="agent-123",
+            worktree_path=str(missing),
+            session_count=2,
+        )
+        assert build_recovery_context("coder-codex-0", missing, identity) is None
+
 
 class TestWorkerSupervisor:
     """Tests for the coder restart supervisor.
@@ -353,4 +371,101 @@ class TestWorkerSupervisor:
         assert call_count == 10, (
             "supervisor stopped before reaching 10 restarts — "
             "max_restarts ceiling must not exist anymore"
+        )
+
+    def test_compute_backoff_scales_and_caps(self):
+        """Exponential backoff doubles per consecutive identical failure
+        and caps at 60s. With base_delay=0 (test mode) the backoff stays 0
+        so existing tests don't slow down.
+
+        Regression: the supervisor used to restart every ``restart_delay``
+        seconds regardless of how many times the same crash occurred,
+        flooding stdout with hundreds of identical tracebacks during a
+        deterministic failure (missing worktree, missing CLI binary).
+        """
+        from codeband.session.supervisor import WorkerSupervisor
+
+        sup_zero = self._build_supervisor(AsyncMock())  # base 0
+        assert sup_zero._compute_backoff(0) == 0.0
+        assert sup_zero._compute_backoff(5) == 0.0
+
+        sup = WorkerSupervisor(
+            worker_id="x", agent_id="y",
+            create_agent_fn=AsyncMock(),
+            state_dir=Path("/tmp"), worktree_path=Path("/tmp"),
+            restart_delay_seconds=5.0,
+        )
+        assert sup._compute_backoff(0) == 5.0
+        assert sup._compute_backoff(1) == 10.0
+        assert sup._compute_backoff(2) == 20.0
+        assert sup._compute_backoff(3) == 40.0
+        assert sup._compute_backoff(4) == 60.0  # capped
+        assert sup._compute_backoff(20) == 60.0  # still capped
+
+    @pytest.mark.asyncio
+    async def test_recovery_context_traceback_logged_once_then_suppressed(
+        self, caplog,
+    ):
+        """Repeat ``build_recovery_context`` failures with the same signature
+        should log the full traceback only on first occurrence; subsequent
+        repeats log a single suppressed-repeat line.
+
+        Regression: the user's log showed the same FileNotFoundError
+        traceback dumped >100 times in a row, ~30 lines each.
+        """
+        import logging
+        from codeband.session.supervisor import WorkerSupervisor
+
+        call_count = 0
+        target_reached = asyncio.Event()
+
+        async def mock_run():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 5:
+                target_reached.set()
+                await asyncio.sleep(60)
+
+        def raising_recovery(*args, **kwargs):
+            raise FileNotFoundError("worktree gone")
+
+        supervisor = WorkerSupervisor(
+            worker_id="coder-codex-0", agent_id="agent-x",
+            create_agent_fn=AsyncMock(
+                return_value=MagicMock(run=mock_run, close=AsyncMock()),
+            ),
+            state_dir=Path("/tmp/test-state"),
+            worktree_path=Path("/tmp/test-worktree"),
+            restart_delay_seconds=0.0,
+        )
+
+        caplog.set_level(logging.WARNING, logger="codeband.session.supervisor")
+        with patch("codeband.session.supervisor.build_recovery_context",
+                   side_effect=raising_recovery):
+            with patch.object(WorkerIdentity, "save"):
+                with patch.object(WorkerIdentity, "load", return_value=None):
+                    task = asyncio.create_task(supervisor.run())
+                    try:
+                        await asyncio.wait_for(target_reached.wait(), timeout=2.0)
+                    finally:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+
+        # session 1 has no recovery context (it's the first cycle), so
+        # build_recovery_context is invoked starting at cycle 2. Of those,
+        # exactly one log entry should carry exc_info (the first occurrence).
+        recovery_records = [
+            r for r in caplog.records
+            if "recovery context" in r.getMessage().lower()
+        ]
+        with_traceback = [r for r in recovery_records if r.exc_info]
+        assert len(with_traceback) == 1, (
+            f"expected exactly one traceback-bearing log; got "
+            f"{len(with_traceback)} of {len(recovery_records)} total"
+        )
+        assert len(recovery_records) >= 2, (
+            "expected at least 2 cycles to fail recovery context"
         )

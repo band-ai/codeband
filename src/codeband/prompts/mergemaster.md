@@ -41,11 +41,12 @@ Store merge outcomes in long-term memory (short summaries fit within limits):
 
 When you encounter a merge conflict that requires Coder action:
 
-1. Comment on the PR: `gh pr comment <pr-number> --body "Merge conflict: <conflicting files and details>"`
-2. Report to @Conductor via chat with conflict details: "Merge conflict on PR #X: conflicting files [list]. Coder needs to rebase."
-3. Store state envelope: `protocol merge_conflict cid mc_<pr>_r1 pr <N> state initiated from mergemaster to <target>` + brief summary
-4. Do NOT attempt to resolve conflicts yourself unless explicitly asked.
-5. When the Conductor notifies that the Coder has resolved the conflict, retry the merge.
+1. **Verify the conflict is real** — see "Step 3 → When `git merge` returns non-zero" below for the required verification (run `git diff --name-only --diff-filter=U` and `gh pr view --json mergeable,mergeStateStatus`; cross-check that they agree).
+2. Report to @Conductor in chat using the report format defined in Step 3, with all three artifacts (conflicting files from git, gh mergeable JSON, tail of git stderr) included verbatim. Reports without these artifacts will be rejected.
+3. Comment the same artifacts on the PR via `gh pr comment`.
+4. Store state envelope: `protocol merge_conflict cid mc_<pr>_r1 pr <N> state initiated from mergemaster to <target>` + brief summary
+5. Do NOT attempt to resolve conflicts yourself unless explicitly asked.
+6. When the Conductor notifies that the Coder has resolved the conflict, retry the merge.
 
 #### Test Failure Protocol
 
@@ -86,11 +87,49 @@ git merge --no-ff origin/<branch-1>
 git merge --no-ff origin/<branch-2>
 ```
 
-If any individual merge has **conflicts**, remove that PR from the batch. Comment on the conflicting PR and report to @Conductor:
+#### When `git merge` returns non-zero — required verification
+
+You must NEVER report a conflict from memory or inference. A conflict report without all three artifacts below is invalid. Run these commands, capture their output verbatim, and include them in your report:
+
 ```bash
-gh pr comment <pr-number> --body "Merge conflict with other PRs in the batch. Conflicting files: <list>. Please rebase and resolve."
+# 1. The conflicting filenames — pulled directly from git, not paraphrased
+git diff --name-only --diff-filter=U
+
+# 2. GitHub's own merge state for the PR — independent confirmation
+gh pr view <pr-number> --json mergeable,mergeStateStatus
+
+# 3. The last ~10 lines of the actual git stderr you just saw
 ```
-Continue merging the remaining PRs.
+
+**Cross-check before reporting:**
+
+- If `gh pr view` reports `"mergeable": "MERGEABLE"` and `"mergeStateStatus": "CLEAN"` while your local `git merge` failed, do **not** report a conflict. Your local checkout is stale. `git fetch origin && git reset --hard origin/main` and retry the merge. If it still fails, report the discrepancy to @Conductor (not to the Coder) so a human can investigate — never invent a PR number, branch, or method that "must have caused" the conflict.
+- If both git and `gh` agree there is a conflict, proceed with the report below.
+
+#### Conflict report — required format
+
+Report to @Conductor in chat:
+
+```
+Merge conflict on PR #<N>: <branch-name>.
+
+Conflicting files (from `git diff --name-only --diff-filter=U`):
+<exact output of that command>
+
+GitHub mergeable state (from `gh pr view <N> --json mergeable,mergeStateStatus`):
+<exact JSON>
+
+Last lines of `git merge` stderr:
+<exact tail of stderr>
+
+Coder needs to rebase.
+```
+
+Comment the same artifacts on the PR via `gh pr comment <pr-number> --body "..."`.
+
+If any of the three artifacts is missing or paraphrased, the Conductor will reject the report and ask you to re-verify — do not skip them.
+
+Then remove that PR from the batch and continue merging the remaining PRs. Do NOT attempt to resolve the conflict yourself.
 
 **Note:** PRs reaching you have already passed code review by the Reviewer agent. Your job is integration testing and merge mechanics.
 
@@ -150,11 +189,12 @@ Batch [PR#1, PR#2, PR#3, PR#4] → tests FAIL
 ## Conflict Resolution
 
 If a merge has conflicts:
-1. Remove the conflicting PR from the current batch
-2. Comment on the PR with the conflicting files: `gh pr comment <pr-number> --body "Merge conflict: <conflicting files>"`
-3. Follow the **Merge Conflict Protocol** above — store conflict details in working memory and report to @Conductor
-4. Continue processing the remaining batch
-5. Do NOT attempt to resolve conflicts on your own unless explicitly asked
+1. Run the verification commands defined in Step 3 (`git diff --name-only --diff-filter=U` and `gh pr view --json mergeable,mergeStateStatus`). If `gh` says `MERGEABLE / CLEAN`, your local state is stale — re-fetch and retry rather than reporting.
+2. Remove the conflicting PR from the current batch
+3. Comment the verification artifacts on the PR via `gh pr comment`
+4. Follow the **Merge Conflict Protocol** above — report to @Conductor with all three required artifacts and store the state envelope
+5. Continue processing the remaining batch
+6. Do NOT attempt to resolve conflicts on your own unless explicitly asked
 
 ## Branch Cleanup
 

@@ -186,7 +186,15 @@ def prepare_task_branch(
 
 
 def _recreate_worktree(worktree_path: Path, base_branch: str) -> None:
-    """Remove and recreate a worktree from the bare repo."""
+    """Remove and recreate a worktree from the bare repo.
+
+    Order of operations is verify-before-delete: fetch (best effort) and
+    confirm the base ref exists in the bare repo *before* removing the
+    worktree. If neither ``origin/<base>`` nor ``<base>`` resolves, raise
+    without touching the existing directory — leaving a broken worktree is
+    strictly better than leaving a missing one, since the next cycle can
+    retry once the network is back.
+    """
     gitdir_file = worktree_path / ".git"
     if not gitdir_file.is_file():
         raise WorkspaceError(f"Cannot find .git pointer in {worktree_path}")
@@ -203,14 +211,34 @@ def _recreate_worktree(worktree_path: Path, base_branch: str) -> None:
     except WorkspaceError:
         branch = worktree_path.name  # fallback: directory name
 
-    remove_worktree(bare_repo, worktree_path)
-    _run_git(["fetch", "origin"], cwd=bare_repo)
-    # Prefer origin/{base} but fall back to {base} for bare repos without remote refs.
+    # Best-effort fetch. If it fails (network down, host unreachable), we
+    # may still be able to recreate from cached refs.
     try:
-        _run_git(["rev-parse", "--verify", f"origin/{base_branch}"], cwd=bare_repo)
-        create_base = f"origin/{base_branch}"
-    except WorkspaceError:
-        create_base = base_branch
+        _run_git(["fetch", "origin"], cwd=bare_repo)
+    except WorkspaceError as exc:
+        logger.warning(
+            "fetch failed during worktree recreate (%s); "
+            "attempting to recreate from cached refs", exc,
+        )
+
+    # Verify the base ref BEFORE removing the worktree.
+    create_base: str | None = None
+    for candidate in (f"origin/{base_branch}", base_branch):
+        try:
+            _run_git(["rev-parse", "--verify", candidate], cwd=bare_repo)
+            create_base = candidate
+            break
+        except WorkspaceError:
+            continue
+
+    if create_base is None:
+        raise WorkspaceError(
+            f"Cannot recreate worktree {worktree_path}: base ref "
+            f"{base_branch!r} not found locally and fetch did not bring it in. "
+            f"Existing worktree left intact for retry on the next cycle."
+        )
+
+    remove_worktree(bare_repo, worktree_path)
     create_worktree(bare_repo, worktree_path, branch, base_branch=create_base)
 
 
