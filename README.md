@@ -23,6 +23,16 @@ It is built for headless operation: local terminals, Linux servers, CI, Docker, 
 - **Risk-aware merging**: low-risk PRs can auto-merge; medium, high, and critical changes wait for approval.
 - **Human-friendly and headless**: use the interactive shell locally, or run the same orchestrator in CI and Docker.
 
+## Parallel Agents
+
+Codeband's main advantage is not raw parallelism; it is adversarial pairing. A task is planned by one model family and reviewed by another, then code written by one model family is reviewed by the other. This catches model-specific blind spots better than asking one model to judge its own work.
+
+Parallel coders are useful when the Planner can split a task into independent subtasks with little file overlap. Each coder gets its own git worktree and branch, so separate subtasks can run at the same time without sharing a working directory. Parallel planners and plan reviewers are useful mostly for throughput across multiple queued tasks; for one task, a single Planner plus one opposite-framework Plan Reviewer is usually enough.
+
+The default configuration is the recommended shape: one Claude Coder, one Codex Coder, one Reviewer from each framework, one Planner, and one opposite-framework Plan Reviewer. You can scale pools with `/scale` in the shell or `cb scale`, then run `cb setup-agents` so Band.ai has matching agents.
+
+For collision-free parallel review, keep opposite-framework reviewer capacity at least as large as coder capacity: Claude coders need Codex reviewers, and Codex coders need Claude reviewers. Today first-dispatch reviewer selection is prompt-enforced from the Worker Pool Roster using deterministic worker-index pairing; full code-backed arbitration is on the roadmap.
+
 ## What You Need
 
 Codeband needs these in every deployment mode:
@@ -188,6 +198,8 @@ For the full design, see [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Known Limitations
 
 Codeband is alpha software. The current architecture is prompt-driven: agents follow structured prompts, and the Conductor relies on model context plus memory state to track protocol progress. The roadmap is to move more protocol state and branch enforcement into deterministic Python code.
+
+Pool scaling is supported, but first-dispatch worker arbitration is still prompt-enforced. For best results, scale coders and their opposite-framework reviewers together, keep planner/plan-reviewer pools small, and avoid configurations where several coders must share one reviewer unless you are comfortable with queued or overlapping review turns.
 
 Current planned work:
 

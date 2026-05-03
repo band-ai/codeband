@@ -35,8 +35,8 @@ Parallelism is a secondary, weaker benefit — Claude Code and Codex both alread
                            │ plan approved
                            ▼
                   ┌────────────────┐
-                  │   Conductor    │  allocates coders + cross-model reviewers
-                  │                │  per subtask from the pool
+                  │   Conductor    │  allocates coders; reviewers are
+                  │                │  direct-dispatched from the roster
                   └──┬──────────┬──┘
                      │          │
         ┌────────────┘          └────────────┐
@@ -83,9 +83,9 @@ Parallelism is a secondary, weaker benefit — Claude Code and Codex both alread
 | **Planner** | Task analyst. Reads the codebase, decomposes tasks into parallelizable subtasks with optional `framework_hint`, sends plans via chat. Emits abstract subtask specs — the Conductor binds specific coders at dispatch. | `claude_sdk` today; Codex planned |
 | **Plan Reviewer** | Plan validation gate. Reviews plans before coders begin — decomposition quality, file conflict risk, acceptance criteria. Paired with Planner on the opposite framework. Read-only codebase access. | `claude_sdk`, `codex` |
 | **Coder** | Coding worker. Executes subtasks in an isolated git worktree (`workspace/worktrees/<worker-id>/`). Auto-restarted by `WorkerSupervisor` on crash. | `claude_sdk`, `codex` |
-| **Code Reviewer** | Code quality gate. Reviews PRs, posts findings as PR comments, assigns a risk level. Allocated by Conductor per-PR on the framework **opposite** the coder. | `claude_sdk`, `codex` |
+| **Code Reviewer** | Code quality gate. Reviews PRs, posts findings as PR comments, assigns a risk level. Directly @mentioned by the Coder on the framework **opposite** the coder. | `claude_sdk`, `codex` |
 
-**Capacity is declared in yaml** under `agents.{planners, plan_reviewers, coders, reviewers}`, with a `count` per framework. The Conductor tracks which pool members are idle vs busy and allocates at dispatch time.
+**Capacity is declared in yaml** under `agents.{planners, plan_reviewers, coders, reviewers}`, with a `count` per framework. The Conductor allocates task owners and fallback routes. First-dispatch reviewer selection is direct: Coders and Planners use the Worker Pool Roster to @mention deterministic opposite-framework reviewers by display name.
 
 ## Communication: Three Channels
 
@@ -101,8 +101,7 @@ Parallelism is a secondary, weaker benefit — Claude Code and Codex both alread
 task room (all agents)
   Planner    → Conductor + Plan Reviewer    full plan via chat (direct, no forwarding)
   Conductor  → Coder                        task assignment (with allocated branch name)
-  Coder      → Conductor                    PR URL + framework tag
-  Conductor  → Code Reviewer (opposite fw)  review assignment
+  Coder      → Conductor + Code Reviewer    PR URL + framework tag (direct review dispatch)
   Code Rev.  → GitHub PR                    detailed findings via gh pr comment
   Code Rev.  → Conductor                    verdict (PASSED/FAILED + risk level)
   Mergemaster → chat                        conflict/failure details
@@ -136,9 +135,7 @@ Each protocol follows the same pattern:
 ### Example — Code Review Protocol (with cross-model allocation)
 
 ```
-Coder-Claude-0 → Conductor (chat): "PR #42 ready: <url>. Framework: claude_sdk."
-Conductor allocates opposite-framework reviewer:
-Conductor → Reviewer-Codex-0 (chat): "Review PR <url>. Coder on claude_sdk; cross-model review expected."
+Coder-Claude-0 → Conductor + Reviewer-Codex-0 (chat): "PR #42 ready: <url>. Framework: claude_sdk."
 Reviewer-Codex-0 reads PR via gh pr diff --repo → posts findings via gh pr comment
 Reviewer-Codex-0 stores state: "protocol code_review cid cr_42_r1 pr 42 round 1 state findings_posted risk medium from reviewer-codex-0 to coder-claude_sdk-0"
 Reviewer-Codex-0 → Conductor (chat): "Review FAILED for PR #42 (risk: medium): 3 critical findings"
@@ -150,11 +147,20 @@ Conductor → Reviewer-Codex-0 (chat): "Coder pushed fixes for PR #42 — please
 
 ## Worker Pool + Allocation
 
-The **worker pool** tracks capacity declared in `codeband.yaml` and handles per-task allocation. Implementation: `src/codeband/workers/pool.py` — a `WorkerPool` with `acquire(role, framework)`, `release(worker_id)`, and `pair_for_task(coder_role, coder_framework)` which atomically reserves a coder and an opposite-framework reviewer.
+The **worker pool** tracks capacity declared in `codeband.yaml` and provides the intended deterministic allocation model. Implementation: `src/codeband/workers/pool.py` — a `WorkerPool` with `acquire(role, framework)`, `release(worker_id)`, and `pair_for_task(coder_role, coder_framework)` which atomically reserves a coder and an opposite-framework reviewer.
 
 Worker identities are `{role}-{framework}-{index}` strings. Band.ai display names are the title-cased version (`Coder-Claude-0`).
 
-Allocation is prompt-enforced in the current MVP — the Conductor prompt reads the Worker Pool Roster appended at the end of its prompt and tracks bindings via memory envelopes. This is on the roadmap to become code-backed (see README Roadmap section).
+Allocation is prompt-enforced in the current MVP. The Worker Pool Roster is appended to the Planner, Conductor, and Coder prompts with concrete display names. Coders and Planners use deterministic worker-index pairing for first dispatch, while the Conductor handles task assignment, re-review routing, and malformed-message fallback. Code-backed arbitration via `WorkerPool` is on the roadmap.
+
+For collision-free parallel review, provision at least one opposite-framework reviewer for each coder in the paired pool:
+
+| Coder capacity | Reviewer capacity needed |
+|----------------|--------------------------|
+| `coders.claude_sdk=N` | `reviewers.codex>=N` |
+| `coders.codex=N` | `reviewers.claude_sdk>=N` |
+
+Use the same pattern for planners and plan reviewers when scaling planning throughput.
 
 ## Memory Model
 
@@ -205,8 +211,8 @@ Each coder has a persistent **workspace branch** (`codeband/coder-<framework>-<N
 5. **Plan Reviewer** → validates decomposition, file conflicts, acceptance criteria
 6. **Plan Reviewer approves** → Conductor allocates coders from the pool per subtask (matching `framework_hint` if set, else any idle coder)
 7. **Coders work in parallel** — each in its own worktree, branch `codeband/<coder-id>/<slug>`
-8. **Coder reports completion** → @mention Conductor with PR URL + framework
-9. **Conductor allocates a cross-model reviewer** → @mentions `Reviewer-<opposite>-<N>` with PR URL
+8. **Coder reports completion** → @mention Conductor and a cross-model Reviewer with PR URL + framework
+9. **Code Reviewer starts from the Coder's direct @mention**; Conductor only performs fallback dispatch if the Coder omitted a Reviewer
 10. **Code Reviewer** → reads PR, posts findings as PR comments, reports verdict
 11. **If review fails** → Code Review Protocol iterates (same reviewer stays) until resolved
 12. **Risk-based routing** → low-risk auto-merges; higher risk waits for `cb approve`
@@ -236,9 +242,9 @@ The Planner minimizes conflicts by spreading subtasks across non-overlapping fil
 
 ## Session Recovery
 
-Coders run under a `WorkerSupervisor` (`session/supervisor.py`) that auto-restarts on crash. Worker identity is persisted as JSON in `workspace/state/<worker-id>.json` (`session/identity.py`). On restart, `session/context.py` rebuilds context from git log + uncommitted changes + `TASK.md`. Configurable via `max_restarts` and `restart_delay_seconds` on each coder pool entry.
+Coders run under a `WorkerSupervisor` (`session/supervisor.py`) that auto-restarts on crash. Worker identity is persisted as JSON in `workspace/state/<worker-id>.json` (`session/identity.py`). On restart, `session/context.py` rebuilds context from git log + uncommitted changes + `TASK.md`. `restart_delay_seconds` on each coder pool entry controls the base delay; repeated identical failures back off up to 60 seconds.
 
-Unsupervised agents (Conductor, Mergemaster, Planners, Plan Reviewers, Code Reviewers) don't auto-restart — a crash triggers a full-system shutdown. Partial orchestration is worse than a clean restart.
+Unsupervised agents (Conductor, Mergemaster, Planners, Plan Reviewers, Code Reviewers) also run under a reconnect-forever loop with exponential backoff. SIGINT/SIGTERM is the normal shutdown path.
 
 ## Design Influences
 

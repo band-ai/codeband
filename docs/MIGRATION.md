@@ -87,9 +87,9 @@ If you had custom prompts in `./prompts/` (project overrides), review them again
 
 - **`planner.md`**: no more "Player Roster" — it's a "Worker Pool Roster" now; subtasks don't name specific players, they emit `framework_hint` and let the Conductor allocate.
 - **`conductor.md`**: new "Worker Pool" + "Allocation" sections; dual-player coordination removed.
-- **`player.md`**: renamed role to "Coder"; identity is `Coder-<Framework>-<N>`; report completion to Conductor only (no longer @mentions Code Reviewer directly).
-- **`code_reviewer.md`**: reviewer is allocated by Conductor per-PR with cross-model pairing; reviewer is now `Reviewer-<Framework>-<N>`.
-- **`plan_reviewer.md`**: minor — dual-player validation dropped.
+- **`player.md`**: renamed role to "Coder"; identity is `Coder-<Framework>-<N>`; report completion by @mentioning both an opposite-framework Code Reviewer and Conductor.
+- **`code_reviewer.md`**: reviewer identity is now `Reviewer-<Framework>-<N>`; first review dispatch comes directly from the Coder, while Conductor handles fallback and re-review routing.
+- **`plan_reviewer.md`**: identity is now `Plan-Reviewer-<Framework>-<N>`; first plan-review dispatch comes directly from the Planner.
 - **`mergemaster.md`**: dual-player comparison section dropped; batch+bisect unchanged.
 
 If your customizations were thin, you can delete `./prompts/` and let the v1 package prompts take over.

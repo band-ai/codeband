@@ -121,6 +121,68 @@ class TestGitOperations:
         assert wt.exists()
         assert (wt / "README.md").exists()
 
+    def test_recreate_worktree_preserves_when_base_ref_missing(
+        self, source_repo: Path, tmp_path: Path,
+    ):
+        """If the base ref cannot be verified, recreate must not destroy the worktree.
+
+        Regression: previously ``_recreate_worktree`` did
+        ``remove_worktree`` -> ``git fetch origin`` -> ``create_worktree``.
+        When fetch failed (e.g. network down), the worktree was already
+        gone and never restored, putting the supervisor in a tight crash
+        loop.
+        """
+        from codeband.workspace.git import WorkspaceError, _recreate_worktree
+
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+
+        wt = tmp_path / "wt" / "player-0"
+        create_worktree(bare, wt, "codeband/player-0/test")
+        assert wt.exists()
+
+        # Recreate against a base branch that exists in NEITHER origin nor
+        # local refs simulates the "fetch couldn't bring in what we need"
+        # case. Recreate should raise rather than silently deleting.
+        with pytest.raises(WorkspaceError):
+            _recreate_worktree(wt, base_branch="branch-that-does-not-exist")
+
+        assert wt.exists(), (
+            "worktree was deleted when recreate could not proceed — "
+            "this is the data-loss bug"
+        )
+
+    def test_recreate_worktree_tolerates_fetch_failure_with_cached_base(
+        self, source_repo: Path, tmp_path: Path,
+    ):
+        """Recreate should still succeed when fetch fails but base ref is cached."""
+        from codeband.workspace.git import _recreate_worktree
+
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+
+        # Discover the actual default branch name.
+        default = subprocess.run(
+            ["git", "-C", str(source_repo), "branch", "--show-current"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        wt = tmp_path / "wt" / "player-0"
+        create_worktree(bare, wt, "codeband/player-0/test")
+
+        # Break the origin so fetch fails, but origin/<default> is already
+        # cached in the bare repo from clone_bare.
+        subprocess.run(
+            ["git", "-C", str(bare), "remote", "set-url", "origin",
+             "/nonexistent/path/to/repo.git"],
+            check=True, capture_output=True,
+        )
+
+        # Should recreate successfully using the cached ref.
+        _recreate_worktree(wt, base_branch=default)
+        assert wt.exists()
+        assert (wt / "README.md").exists()
+
     def test_commit_no_changes(self, source_repo: Path, tmp_path: Path):
         """Commit with no changes is a no-op."""
         bare = tmp_path / "bare.git"

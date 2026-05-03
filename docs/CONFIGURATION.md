@@ -81,23 +81,24 @@ Every role can use either framework. The default keeps Conductor and Mergemaster
 
 ## Cross-Model Pairing
 
-The Conductor enforces adversarial pairing at runtime:
+Codeband enforces adversarial pairing through the agent prompts and Worker Pool Roster:
 
 - Claude Coder PRs route to Codex Reviewers.
 - Codex Coder PRs route to Claude Reviewers.
 - Claude plans route to Codex Plan Reviewers.
 - Codex plans route to Claude Plan Reviewers.
 
-If an opposite-framework reviewer is unavailable, Codeband falls back to same-framework review with a warning. `cb doctor` warns when configuration makes cross-model pairing impossible.
+Coders dispatch first reviews directly to concrete reviewer display names, using deterministic worker-index pairing from the roster. For example, `Coder-Claude-1` prefers `Reviewer-Codex-1`; if only one Codex reviewer exists, it falls back to `Reviewer-Codex-0` and reports that reviewer capacity is shared. If an opposite-framework reviewer is unavailable, Codeband falls back to same-framework review with a warning. `cb doctor` warns when configuration makes cross-model pairing impossible or when reviewer capacity is lower than matching coder capacity.
 
 ## Scaling
 
 Use `cb scale` to adjust pool sizes:
 
 ```bash
-cb scale coders.claude_sdk=4
-cb scale coders.codex=0
+cb scale coders.claude_sdk=2
 cb scale reviewers.codex=2
+cb scale coders.codex=2
+cb scale reviewers.claude_sdk=2
 ```
 
 After scaling:
@@ -108,6 +109,15 @@ cb
 ```
 
 `cb scale` prints the new total agent count and warns if the config exceeds the free-tier 10-agent cap.
+
+Scale coders and opposite-framework reviewers together for clean parallel review:
+
+| Coder pool | Reviewer pool needed for cross-model review |
+|------------|---------------------------------------------|
+| `coders.claude_sdk=N` | `reviewers.codex>=N` |
+| `coders.codex=N` | `reviewers.claude_sdk>=N` |
+
+Multiple planners and plan reviewers are supported, but they are mainly a throughput feature for multiple queued tasks. For a single task, one Planner and one opposite-framework Plan Reviewer is usually the best default. If you scale them, keep the same pairing rule: `planners.claude_sdk=N` should have `plan_reviewers.codex>=N`, and `planners.codex=N` should have `plan_reviewers.claude_sdk>=N`.
 
 ## Review Guidelines
 

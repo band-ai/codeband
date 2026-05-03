@@ -664,6 +664,7 @@ async def run_local(
             agent_id=creds.agent_id,
             create_agent_fn=_coder_factory(
                 wid.framework, resolved_config, wt_path, creds,
+                worker_roster=worker_roster,
             ),
             state_dir=layout.state_dir,
             worktree_path=wt_path,
@@ -877,12 +878,14 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
 
         # Look up pool entry for restart settings.
         entry = resolved_config.agents.coders.entry_for(framework)
+        roster = _build_worker_roster(resolved_config)
 
         supervisor = WorkerSupervisor(
             worker_id=agent_key,
             agent_id=creds.agent_id,
             create_agent_fn=_coder_factory(
                 framework, resolved_config, layout.worktree, creds,
+                worker_roster=roster,
             ),
             state_dir=layout.state_dir,
             worktree_path=layout.worktree,
@@ -953,28 +956,43 @@ def _framework_from_key(key: str) -> Framework:
 # ─── prompt roster ──────────────────────────────────────────────────────────
 
 def _build_worker_roster(config: CodebandConfig) -> str:
-    """Build a worker-pool roster for the Planner/Conductor prompts.
+    """Build a worker-pool roster for the Planner/Conductor/Coder prompts.
 
     Describes available capacity in the coder and reviewer pools so the
     Planner can emit framework hints and the Conductor can route to the
-    right pool. Reviewers appear as paired capacity for cross-model review.
+    right pool. Concrete display names let Coders and Planners @mention a
+    deterministic opposite-framework reviewer without relying on a relay.
     """
     lines = ["## Worker Pool Roster", ""]
-    lines.append("| Role | Framework | Count | Description |")
-    lines.append("|------|-----------|-------|-------------|")
+    lines.append("| Role | Framework | Count | Workers | Description |")
+    lines.append("|------|-----------|-------|---------|-------------|")
 
-    def _rows(role_label: str, pool: FrameworkPool) -> None:
+    display_role = {
+        WorkerRole.CODER: "Coder",
+        WorkerRole.REVIEWER: "Reviewer",
+        WorkerRole.PLANNER: "Planner",
+        WorkerRole.PLAN_REVIEWER: "Plan-Reviewer",
+    }
+
+    def _display_name(role: WorkerRole, fw: Framework, index: int) -> str:
+        fw_label = "Claude" if fw == Framework.CLAUDE_SDK else "Codex"
+        return f"{display_role[role]}-{fw_label}-{index}"
+
+    def _rows(role: WorkerRole, role_label: str, pool: FrameworkPool) -> None:
         for fw in (Framework.CLAUDE_SDK, Framework.CODEX):
             entry: PoolEntry = pool.entry_for(fw)
             if entry.count == 0:
                 continue
             desc = entry.description or ""
-            lines.append(f"| {role_label} | {fw.value} | {entry.count} | {desc} |")
+            workers = ", ".join(_display_name(role, fw, i) for i in range(entry.count))
+            lines.append(
+                f"| {role_label} | {fw.value} | {entry.count} | {workers} | {desc} |",
+            )
 
-    _rows("Coder", config.agents.coders)
-    _rows("Code Reviewer", config.agents.reviewers)
-    _rows("Planner", config.agents.planners)
-    _rows("Plan Reviewer", config.agents.plan_reviewers)
+    _rows(WorkerRole.CODER, "Coder", config.agents.coders)
+    _rows(WorkerRole.REVIEWER, "Code Reviewer", config.agents.reviewers)
+    _rows(WorkerRole.PLANNER, "Planner", config.agents.planners)
+    _rows(WorkerRole.PLAN_REVIEWER, "Plan Reviewer", config.agents.plan_reviewers)
     return "\n".join(lines)
 
 
@@ -1084,6 +1102,7 @@ def _create_coder(
     workspace: str | None,
     *,
     recovery_context: str | None = None,
+    worker_roster: str | None = None,
 ) -> "FrameworkAdapter":
     """Create a coder adapter for the given framework.
 
@@ -1091,6 +1110,12 @@ def _create_coder(
     customizations in `codeband.yaml` (e.g., `coders.claude_sdk.model:
     claude-opus-4-7`) are respected at runtime. When `model` is unset on
     the pool entry, we pass None to the runner and let its default apply.
+
+    `worker_roster` is the same Worker Pool Roster injected into the
+    Conductor and Planner prompts (see ``_build_worker_roster``). The Coder
+    needs it so that at PR completion time it can pick an opposite-framework
+    Code Reviewer from the pool and @mention them directly — instead of
+    routing every review through the Conductor as a relay.
     """
     entry = config.agents.coders.entry_for(framework)
 
@@ -1100,6 +1125,7 @@ def _create_coder(
         kwargs: dict = dict(
             workspace=workspace,
             recovery_context=recovery_context,
+            worker_roster=worker_roster,
         )
         if entry.model:
             kwargs["model"] = entry.model
@@ -1112,6 +1138,7 @@ def _create_coder(
         kwargs = dict(
             workspace=workspace,
             recovery_context=recovery_context,
+            worker_roster=worker_roster,
         )
         if entry.model:
             kwargs["model"] = entry.model
@@ -1148,6 +1175,8 @@ def _coder_factory(
     config: CodebandConfig,
     worktree_path: Path | None,
     creds: "AgentCredentials",
+    *,
+    worker_roster: str | None = None,
 ):
     """Return an async callable that creates a fresh coder Agent on each restart."""
     async def create(*, recovery_context: str | None = None):
@@ -1155,6 +1184,7 @@ def _coder_factory(
         adapter = _create_coder(
             framework, config, workspace,
             recovery_context=recovery_context,
+            worker_roster=worker_roster,
         )
         return _create_band_agent(adapter, creds, config)
 

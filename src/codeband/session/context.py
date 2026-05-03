@@ -18,12 +18,24 @@ def build_recovery_context(
     base_branch: str = "main",
     max_log_entries: int = 20,
     assignment: dict | None = None,
-) -> str:
+) -> str | None:
     """Build a recovery prompt for a restarting coder session.
 
     If assignment contains a task_branch, checks out that branch
     deterministically before gathering git state.
+
+    Returns None when the worktree directory no longer exists (e.g. an earlier
+    ``_recreate_worktree`` removed it but couldn't recreate it after a network
+    failure). The agent then starts fresh from chat instead of crashing the
+    supervisor's recovery path.
     """
+    if not worktree_path.exists():
+        logger.info(
+            "Worktree %s missing for %s — skipping recovery context",
+            worktree_path, worker_id,
+        )
+        return None
+
     assignment = assignment or {}
     task_branch = assignment.get("task_branch")
     pr_number = assignment.get("pr_number")

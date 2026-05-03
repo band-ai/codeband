@@ -4,12 +4,52 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from codeband.config import WatchdogConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _mentioned_participant_ids(
+    msg: Any, participant_names: dict[str, str],
+) -> set[str]:
+    """Return the set of participant ids mentioned in this chat message.
+
+    Tries structured ``msg.mentions`` first (Band.ai chat messages carry
+    mentions as a list of items with ``.id``); falls back to scanning the
+    message content for ``@<display_name>`` with right-side word-boundary
+    semantics so ``@Coder-Claude-0`` does not match ``@Coder-Claude-01``.
+    Test mocks that don't set these fields are silently ignored — the
+    isinstance checks reject MagicMock-typed sentinels.
+    """
+    found: set[str] = set()
+
+    raw_mentions = getattr(msg, "mentions", None)
+    if isinstance(raw_mentions, (list, tuple)):
+        for item in raw_mentions:
+            mid = getattr(item, "id", None)
+            if isinstance(mid, str) and mid in participant_names:
+                found.add(mid)
+
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        for pid, pname in participant_names.items():
+            if not pname:
+                continue
+            # Both-sided word boundary: `@` must be a true mention prefix
+            # (not part of a longer token like `email@Coder-Claude-0`), and
+            # trailing chars must terminate the name (so `@Coder-Claude-0`
+            # is not a substring match of `@Coder-Claude-01`).
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_\-])@{re.escape(pname)}(?![A-Za-z0-9_\-])",
+            )
+            if pattern.search(content):
+                found.add(pid)
+
+    return found
 
 
 @dataclasses.dataclass
@@ -123,9 +163,11 @@ class WatchdogDaemon:
 
         The Conductor writes these envelopes (see ``prompts/conductor.md``):
         ``swarm status active task <slug>`` when accepting a new user task,
+        ``swarm status waiting_human_approval task <slug> pr <N>`` while a PR
+        is blocked on a human merge decision, and
         ``swarm status complete task <slug>`` when reporting completion. We
-        gate patrols on this so a fully-idle swarm is not poked between
-        user tasks.
+        gate patrols on this so a fully-idle or correctly-waiting swarm is not
+        poked between actionable steps.
         """
         try:
             if self._memory_store is not None:
@@ -191,20 +233,22 @@ class WatchdogDaemon:
         """Single patrol cycle: check all rooms for stale agents."""
         now = datetime.now(UTC)
 
-        # Gate: if the Conductor has reported task completion to the user
-        # within the idle-grace window, the swarm has nothing to do — skip
-        # nudging entirely. Falls through (today's time-based behavior) when
-        # no envelope exists, so a fresh swarm or one whose Conductor has
-        # not yet adopted the protocol is unaffected.
+        # Gate: if the Conductor has reported task completion or is waiting on
+        # a human merge approval within the idle-grace window, the agents have
+        # nothing actionable to do — skip nudging entirely. Falls through
+        # (today's time-based behavior) when no envelope exists, so a fresh
+        # swarm or one whose Conductor has not yet adopted the protocol is
+        # unaffected.
         status = await self._read_latest_swarm_status()
         if status is not None:
             state, written_at = status
             grace = timedelta(seconds=self._config.swarm_idle_grace_seconds)
-            if state == "complete" and now - written_at < grace:
+            if state in {"complete", "waiting_human_approval"} and now - written_at < grace:
                 if not self._idle_skip_logged:
                     logger.info(
-                        "Watchdog: swarm status is 'complete' (written %ds ago) — "
+                        "Watchdog: swarm status is '%s' (written %ds ago) — "
                         "suppressing nudges until grace window of %ds elapses",
+                        state,
                         int((now - written_at).total_seconds()),
                         self._config.swarm_idle_grace_seconds,
                     )
@@ -266,19 +310,46 @@ class WatchdogDaemon:
                 if p.type == "Agent"
             }
 
-            latest: dict[str, datetime] = {}
+            # Per-agent activity signals.
+            # `last_message`: the agent itself spoke. `last_mentioned`: another
+            # participant @-mentioned the agent (e.g. the Conductor dispatched
+            # work to a Coder). The staleness clock starts from the most recent
+            # of the two — without this, an agent dispatched a task but
+            # crashing before its first reply is invisible to the patrol and
+            # never gets nudged.
+            last_message: dict[str, datetime] = {}
+            last_mentioned: dict[str, datetime] = {}
             for msg in messages:
                 sender = msg.sender_id
                 ts = msg.inserted_at
-                if sender not in participant_names:
+                if ts is None:
                     continue
-                if ts is not None and (sender not in latest or ts > latest[sender]):
-                    latest[sender] = ts
+                if sender in participant_names and (
+                    sender not in last_message or ts > last_message[sender]
+                ):
+                    last_message[sender] = ts
+                # Mentions: a sender does not start their own staleness clock
+                # by mentioning themselves, so skip self-mentions.
+                for mid in _mentioned_participant_ids(msg, participant_names):
+                    if mid == sender:
+                        continue
+                    if mid not in last_mentioned or ts > last_mentioned[mid]:
+                        last_mentioned[mid] = ts
 
-            # Check each agent (skip self)
-            for agent_id, last_seen in latest.items():
+            # Iterate every agent participant (skip self). An agent that has
+            # neither spoken nor been mentioned is "untracked" — preserve the
+            # historical behavior of not nudging dormant pool members who
+            # haven't been given any work yet.
+            for agent_id in participant_names:
                 if agent_id == self._agent_id:
                     continue
+                last_msg_ts = last_message.get(agent_id)
+                last_mention_ts = last_mentioned.get(agent_id)
+                if last_msg_ts is None and last_mention_ts is None:
+                    continue
+                last_seen = max(
+                    t for t in (last_msg_ts, last_mention_ts) if t is not None
+                )
 
                 threshold = self._threshold_for(agent_id)
                 staleness = now - last_seen
