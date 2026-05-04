@@ -52,6 +52,24 @@ def _mentioned_participant_ids(
     return found
 
 
+_TERMINAL_PROTOCOL_RE = re.compile(
+    r"("
+    r"\bReview\s+(?:PASSED|FAILED)\b|"
+    r"\bReview requested for PR\s+#?\d+\b|"
+    r"\bMerged\s+PR\s+#?\d+\b|"
+    r"\bcomplete\s+and\s+ready\s+for\s+review\b|"
+    r"\bStatus:\s*idle\b|"
+    r"\bIdle\b.*\bNo pending work\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_terminal_protocol_message(content: Any) -> bool:
+    """True when an agent's latest message says its current protocol work is done."""
+    return isinstance(content, str) and bool(_TERMINAL_PROTOCOL_RE.search(content))
+
+
 @dataclasses.dataclass
 class AgentHealthState:
     """In-memory health tracking for a single agent."""
@@ -318,6 +336,7 @@ class WatchdogDaemon:
             # crashing before its first reply is invisible to the patrol and
             # never gets nudged.
             last_message: dict[str, datetime] = {}
+            last_message_content: dict[str, Any] = {}
             last_mentioned: dict[str, datetime] = {}
             for msg in messages:
                 sender = msg.sender_id
@@ -328,6 +347,7 @@ class WatchdogDaemon:
                     sender not in last_message or ts > last_message[sender]
                 ):
                     last_message[sender] = ts
+                    last_message_content[sender] = getattr(msg, "content", None)
                 # Mentions: a sender does not start their own staleness clock
                 # by mentioning themselves, so skip self-mentions.
                 for mid in _mentioned_participant_ids(msg, participant_names):
@@ -346,6 +366,15 @@ class WatchdogDaemon:
                 last_msg_ts = last_message.get(agent_id)
                 last_mention_ts = last_mentioned.get(agent_id)
                 if last_msg_ts is None and last_mention_ts is None:
+                    continue
+                if (
+                    last_msg_ts is not None
+                    and (last_mention_ts is None or last_msg_ts >= last_mention_ts)
+                    and _is_terminal_protocol_message(
+                        last_message_content.get(agent_id),
+                    )
+                ):
+                    self._state.pop(agent_id, None)
                     continue
                 last_seen = max(
                     t for t in (last_msg_ts, last_mention_ts) if t is not None

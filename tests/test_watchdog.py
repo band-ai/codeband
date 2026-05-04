@@ -120,7 +120,96 @@ class TestWatchdogDaemon:
         daemon = WatchdogDaemon(
             config=watchdog_config,
             rest_client=mock_rest_client,
-            agent_id="agent-wd",
+            agent_id="agent-cond",
+            conductor_id="agent-cond",
+        )
+
+        await daemon._patrol()
+
+        mock_rest_client.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reviewer_verdict_makes_reviewer_idle(
+        self, watchdog_config, mock_rest_client,
+    ):
+        """A reviewer who already reported a verdict must not be nudged.
+
+        Regression: after a code reviewer sent "Review PASSED", the swarm was
+        still globally active because the PR had not been merged yet. The
+        watchdog treated the correctly-idle reviewer as stale and sent a noisy
+        status check.
+        """
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        dispatch = _make_message("agent-coder", minutes_ago=8)
+        dispatch.content = (
+            "@Reviewer-Claude-0 Review requested for PR #2: "
+            "https://github.com/o/r/pull/2"
+        )
+        verdict = _make_message("agent-reviewer", minutes_ago=6)
+        verdict.content = "@Conductor Review PASSED for PR #2 (risk: low)."
+
+        mock_rest_client.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=_make_chats_response([_make_chat_room("room-1")]),
+        )
+        mock_rest_client.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=_make_messages_response([dispatch, verdict]),
+        )
+        mock_rest_client.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=_make_participants_response([
+                ("agent-wd", "Watchdog"),
+                ("agent-cond", "Conductor"),
+                ("agent-coder", "Coder-Codex-0"),
+                ("agent-reviewer", "Reviewer-Claude-0"),
+            ]),
+        )
+        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock()
+
+        daemon = WatchdogDaemon(
+            config=watchdog_config,
+            rest_client=mock_rest_client,
+            agent_id="agent-cond",
+            conductor_id="agent-cond",
+        )
+
+        await daemon._patrol()
+
+        mock_rest_client.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mergemaster_merge_result_makes_mergemaster_idle(
+        self, watchdog_config, mock_rest_client,
+    ):
+        """A completed merge report means Mergemaster is idle until re-mentioned."""
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        request = _make_message("agent-cond", minutes_ago=20)
+        request.content = "@Mergemaster — please merge PR #2."
+        result = _make_message("agent-mm", minutes_ago=16)
+        result.content = (
+            "@Conductor Merged PR #2 into master. Tests: 1643 passed, "
+            "same 8 pre-existing failures."
+        )
+
+        mock_rest_client.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=_make_chats_response([_make_chat_room("room-1")]),
+        )
+        mock_rest_client.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=_make_messages_response([request, result]),
+        )
+        mock_rest_client.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=_make_participants_response([
+                ("agent-wd", "Watchdog"),
+                ("agent-cond", "Conductor"),
+                ("agent-mm", "Mergemaster"),
+            ]),
+        )
+        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock()
+
+        daemon = WatchdogDaemon(
+            config=watchdog_config,
+            rest_client=mock_rest_client,
+            agent_id="agent-cond",
             conductor_id="agent-cond",
         )
 
