@@ -140,12 +140,27 @@ class WatchdogDaemon:
         human_rest_client: Any | None = None,
         local_memory_store: Any | None = None,
         state_store: Any | None = None,
+        owner_id: str | None = None,
+        owner_handle: str | None = None,
     ):
         self._config = config
         self._rest = rest_client
         self._human_rest = human_rest_client
         self._agent_id = agent_id
         self._conductor_id = conductor_id
+        # Owner/CC participant to @mention when a subtask lands in ``blocked``
+        # (from ANY source — the watchdog's own stall cap, the verify-attempt
+        # cap, or the review-round cap). ``owner_id`` is the Band participant id
+        # used for the structured mention; ``owner_handle`` is the display name
+        # for the message text (falls back to the id). DORMANT by default: when
+        # ``owner_id`` is None (the runner does not pass it pre-activation) the
+        # blocked-escalation patrol is a no-op, so this ships safely ahead of the
+        # verify-gate activation. The CC-side Monitors remain the fail-safe.
+        self._owner_id = owner_id
+        self._owner_handle = owner_handle
+        # Escalate-once per subtask, so a blocked subtask is announced to the
+        # owner a single time rather than every patrol.
+        self._owner_escalated: set[str] = set()
         self._state: dict[str, AgentHealthState] = {}
         # Durable state store (RFC WS1). May be None — when absent the watchdog
         # degrades to chat-recency-only behavior and the mechanical-progress
@@ -494,6 +509,12 @@ class WatchdogDaemon:
         # failure never breaks the patrol loop.
         await self._check_subtask_progress(now)
 
+        # Fourth rung: owner escalation for subtasks already in ``blocked`` —
+        # from ANY source (stall cap, verify cap, review cap). Dormant until an
+        # owner_id is supplied (post-activation); guarded so a notify failure
+        # never breaks the patrol loop.
+        await self._check_blocked_subtasks(now)
+
     async def _check_subtask_progress(self, now: datetime) -> None:
         """Detect stalled subtasks via mechanical signals and escalate (RFC WS4).
 
@@ -727,6 +748,123 @@ class WatchdogDaemon:
                 "FSM blocked-transition failed for %s", sub.subtask_id,
             )
             return False
+
+    async def _check_blocked_subtasks(self, now: datetime) -> None:
+        """Escalate any ``blocked`` subtask to the owner via a Band @mention.
+
+        Independent of how the subtask reached ``blocked`` — the watchdog's own
+        stall cap, the ``cb-phase verify`` attempt cap, or the FSM review-round
+        cap all land here. Each blocked subtask is announced to the owner exactly
+        once (escalate-once via ``_owner_escalated``).
+
+        Fully no-ops when no store is wired or no ``owner_id`` was supplied — the
+        latter is the dormant default pre-activation. Guarded so a store read or
+        a notify failure never breaks the patrol loop.
+        """
+        import asyncio
+
+        if self._store is None or self._owner_id is None:
+            return
+
+        try:
+            subtasks = await asyncio.to_thread(self._store.list_active_subtasks)
+        except Exception:
+            logger.debug(
+                "Watchdog could not list subtasks for owner escalation",
+                exc_info=True,
+            )
+            return
+
+        for sub in subtasks:
+            if sub.state != "blocked" or sub.subtask_id in self._owner_escalated:
+                continue
+            # Flip escalate-once BEFORE the send so a server rejection (e.g.
+            # mention validation) doesn't re-fire the owner every patrol.
+            self._owner_escalated.add(sub.subtask_id)
+            try:
+                await self._send_owner_blocked_escalation(sub)
+            except Exception:
+                logger.exception(
+                    "Failed owner escalation for blocked subtask %s",
+                    sub.subtask_id,
+                )
+
+    async def _send_owner_blocked_escalation(self, sub: Any) -> None:
+        """@mention the owner about a blocked subtask, with its blocked reason.
+
+        The owner is a distinct room participant (not the Conductor whose
+        credentials the watchdog borrows), so the mention is valid. The message
+        carries the subtask id and the durable reason recorded on the blocked
+        transition so the owner has actionable context.
+        """
+        import asyncio
+
+        reason = (
+            await asyncio.to_thread(self._blocked_reason, sub.subtask_id)
+            or "no mechanical progress / cap reached"
+        )
+
+        room_id: str | None = None
+        try:
+            task = await asyncio.to_thread(self._store.get_task, sub.task_id)
+            room_id = getattr(task, "room_id", None) if task else None
+        except Exception:
+            logger.debug(
+                "Could not resolve room for owner escalation", exc_info=True,
+            )
+        if room_id is None:
+            return
+
+        from thenvoi_rest.types import (
+            ChatMessageRequest,
+            ChatMessageRequestMentionsItem,
+        )
+
+        handle = self._owner_handle or self._owner_id
+        if self._activity:
+            self._activity.log(
+                "SUBTASK_BLOCKED_OWNER_ESCALATION", "watchdog",
+                f"Escalated blocked subtask {sub.subtask_id} to owner {handle}",
+            )
+        await self._rest.agent_api_messages.create_agent_chat_message(
+            chat_id=room_id,
+            message=ChatMessageRequest(
+                content=(
+                    f"@{handle} subtask {sub.subtask_id} is BLOCKED "
+                    f"({reason}). It needs a human decision — reassign, "
+                    f"intervene, or abandon."
+                ),
+                mentions=[ChatMessageRequestMentionsItem(id=self._owner_id)],
+            ),
+        )
+
+    def _blocked_reason(self, subtask_id: str) -> str | None:
+        """Return the ``reason`` of the latest ``→ blocked`` transition, if any.
+
+        Reads the store's SQLite file directly (read-only), mirroring
+        :meth:`_latest_transition`. Returns ``None`` when no blocked transition
+        is recorded or the reason is empty.
+        """
+        db_path = getattr(self._store, "db_path", None)
+        if db_path is None:
+            return None
+        try:
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                row = conn.execute(
+                    "SELECT reason FROM transition_log "
+                    "WHERE subtask_id = ? AND to_state = 'blocked' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (subtask_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            logger.debug("Could not read blocked reason", exc_info=True)
+            return None
+        if not row or not row[0]:
+            return None
+        return row[0]
 
     async def _send_nudge(
         self, room_id: str, agent_id: str, names: dict[str, str],
