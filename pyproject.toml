@@ -53,6 +53,7 @@ dev = [
 [project.scripts]
 cb = "codeband.cli:cli"
 codeband = "codeband.cli:cli"
+cb-phase = "codeband.cli.handoff:main"
 
 [project.urls]
 Homepage = "https://github.com/thenvoi/codeband"
