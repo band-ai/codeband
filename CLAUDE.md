@@ -87,3 +87,34 @@ Agent system prompts live in `src/codeband/prompts/*.md` and are loaded directly
 - `from __future__ import annotations` in every file
 - Band.ai SDK imports are deferred (inside functions) to keep import time fast and avoid hard dependency when only config/workspace code is used
 - Tests use `tmp_path` fixtures for filesystem isolation; git integration tests create real repos with `subprocess`
+
+---
+
+## Determinism fleet (fork-local coordination)
+
+> This section coordinates the multi-session build of the determinism RFC in this **fork**. It is not part of upstream codeband — exclude it when upstreaming phase branches.
+
+We are implementing [`docs/rfc-deterministic-orchestration.md`](docs/rfc-deterministic-orchestration.md) as **one independent Claude Code session per phase**, each in its own git worktree, each landing **one PR**. Before writing code, read your phase's RFC workstream in full.
+
+**Guiding principle:** the LLM decides, code enforces and remembers — the FSM gates EFFECTS (transitions/merges), not the Conductor's creative routing.
+
+| Phase / worktree | RFC workstream | Owns (new files) | May edit | Depends on |
+|---|---|---|---|---|
+| `phase-1-state-store` | WS1 | `state/__init__.py`, `state/store.py`, `tests/test_state_store.py` | `orchestration/runner.py` (`_install_memory_backend`), `orchestration/kickoff.py` (`send_task`) | — (**blocks all**) |
+| `phase-2-fsm-gates` | WS2+WS3 | `state/fsm.py`, `cli/__init__.py` (move from `cli.py`), `cli/handoff.py`, `tests/test_fsm.py`, `tests/test_handoff.py` | `pyproject.toml`, `config.py` (`AgentsConfig`) | Phase 1 |
+| `phase-3-watchdog` | WS4 | `tests/test_watchdog_upgrade.py` | `agents/watchdog.py`, `config.py` (`WatchdogConfig`), maybe `orchestration/runner.py` | Phase 1 |
+| `phase-4-rehydration` | WS5 | `state/rehydration.py`, `tests/test_rehydration.py` | `orchestration/runner.py` (5 factories + `_run_agent_forever`), `agents/{conductor,planner,plan_reviewer,code_reviewer,mergemaster}.py`, `orchestration/agent_main.py` | Phase 1 |
+
+**Merge order:** Phase 1 first (everything imports `state.store`). Then Phase 2 ∥ Phase 3. Phase 4 last (heaviest `runner.py` edits). Overlap to rebase around: `config.py` (P2 vs P3, different classes) and `runner.py` (P1/P3/P4).
+
+**Rules for every session:**
+- Stay in your lane — implement exactly your phase; do not touch other phases' files. If you need to, STOP and report.
+- Branch + PR always; never commit to `main`; Conventional Commits.
+- Run the suite before push; add **no new failures**. Self-review (`git diff main...HEAD`) — scope must match the phase only.
+
+**Dev env (per worktree — `.venv` is not shared):**
+```
+uv venv && uv pip install -e ".[dev]"
+.venv/bin/python -m pytest -q
+```
+**Baseline on `main` (2026-05-31): 531 passed, 3 PRE-EXISTING failures — do NOT fix:** `tests/test_cli_dotenv.py::test_clirunner_subcommand_dir_loads_env`, `tests/test_diff.py::test_cli_diff_missing_arg_lists_workers`, `tests/test_diff.py::test_cli_diff_resolves_and_renders` (unrelated `CliRunner` `TypeError`). Acceptance for any phase = those same 3 (and only those 3) still fail; your new tests pass.
