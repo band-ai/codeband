@@ -74,6 +74,11 @@ class SubtaskRow:
     created_at: str
     updated_at: str
     metadata: dict[str, Any] | None = None
+    # Count of completed review rounds — incremented by the FSM each time the
+    # subtask *enters* ``review_failed`` (one failed review = one round). Durable
+    # so the per-subtask review-round cap survives a crash/reopen mid-loop and
+    # cannot be reset by rehydration. Distinct from the watchdog's stall counter.
+    review_round: int = 0
 
 
 _SCHEMA = """
@@ -93,7 +98,8 @@ CREATE TABLE IF NOT EXISTS subtask_states (
     pr_number       INTEGER,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
-    metadata        TEXT
+    metadata        TEXT,
+    review_round    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS transition_log (
@@ -152,6 +158,28 @@ class StateStore:
     def _init_schema(self) -> None:
         with self._transaction() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Apply additive column migrations to a pre-existing schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op against a DB created by an
+        older version, so a column added after first release must be patched in
+        with ``ALTER TABLE``. Each migration is guarded on ``PRAGMA
+        table_info`` so it runs at most once and never on a fresh DB. The
+        ``DEFAULT 0`` backfills existing rows, so a subtask that predates the
+        review-round cap simply starts the loop at round 0.
+        """
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(subtask_states)").fetchall()
+        }
+        if "review_round" not in cols:
+            conn.execute(
+                "ALTER TABLE subtask_states "
+                "ADD COLUMN review_round INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ── tasks ──────────────────────────────────────────────────────────────
 
@@ -267,4 +295,5 @@ def _subtask_from_row(row: sqlite3.Row) -> SubtaskRow:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         metadata=json.loads(raw_metadata) if raw_metadata else None,
+        review_round=row["review_round"],
     )

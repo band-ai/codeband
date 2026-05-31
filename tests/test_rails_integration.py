@@ -32,17 +32,21 @@ Coverage map:
   merge before approval, and the global cycle cap across the live set.
 * ``TestWatchdogRealGit`` — the mechanical progress signal reading *actual*
   ``git rev-parse`` output, HEAD-advanced vs not, with NO mocked subprocess.
+* ``TestReviewRoundCap`` — the FSM's per-subtask review-round cap: a *productive*
+  ``review_failed → in_progress → … → review_failed`` loop (a real commit each
+  round, HEAD advancing) is bounded in code, the count is durable across a store
+  reopen, the counters are per-subtask, and the cap is a mechanism *distinct*
+  from the watchdog stall cap (which never fires on a progressing loop).
 
-A note on "round caps" (RFC §two-level model, fan-out invariants): the FSM
-(``state/fsm.py``) has **no per-subtask review-round counter** — the
-``review_failed → in_progress → … → review_pending → review_failed`` loop is
-not bounded in code. The only cap the rails actually implement is the
-watchdog's ``max_phase_visits`` *mechanical stall cap* (RFC line 178 equates the
-"cycle/stall cap" with ``max_phase_visits``). So "round caps enforced globally"
-is exercised here as that stall cap applied across the full live set of
-concurrent subtasks (``TestFanoutInvariants.test_global_cycle_cap_across_set``
-+ ``TestWatchdogRealGit``), not as an FSM review-round counter. See the report
-for this distinction.
+The two caps are disjoint by construction. The watchdog's ``max_phase_visits``
+is a *mechanical stall cap* (RFC line 178): it fires on the *absence* of
+progress — no git-HEAD change and no new transition across N patrols — so it
+cannot bound a loop that commits real code every round. The FSM's
+``MAX_REVIEW_ROUNDS`` is a *review-round cap*: it counts how many times a
+subtask has bounced back from review and refuses a further rework cycle once the
+count is reached, regardless of how much progress each round made.
+``TestReviewRoundCap.test_round_cap_distinct_from_watchdog_stall_cap`` drives the
+exact loop the watchdog passes and the round cap rejects.
 """
 
 from __future__ import annotations
@@ -65,7 +69,7 @@ from codeband.config import (
     WorkspaceConfig,
 )
 from codeband.state import StateStore
-from codeband.state.fsm import InvalidTransitionError, transition
+from codeband.state.fsm import MAX_REVIEW_ROUNDS, InvalidTransitionError, transition
 from codeband.state.rehydration import build_agent_recovery_context
 
 
@@ -628,3 +632,222 @@ class TestWatchdogRealGit:
             r["to_state"] == "blocked" and r["caller_role"] == "watchdog"
             for r in _log_rows(store, "st-b")
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Per-subtask review-round cap — bounds a PROGRESSING loop in code
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestReviewRoundCap:
+    """The FSM's durable per-subtask review-round cap (``MAX_REVIEW_ROUNDS``).
+
+    This is the loop the watchdog cannot catch: ``review_failed → in_progress →
+    verify_pending → review_pending → review_failed`` with a *real commit every
+    round*, so git HEAD advances and the watchdog's stall cap never fires. The
+    cap is enforced in ``fsm.transition`` against a durable count, so it survives
+    a crash/reopen and is independent per subtask.
+    """
+
+    # ── helpers ────────────────────────────────────────────────────────────
+
+    def _fsm_cycle_to_review_failed(self, store, sid, *, first):
+        """Run one review cycle ending at ``review_failed`` (pure FSM, no git).
+
+        ``first=True`` starts from ``planned`` (assign first); otherwise starts
+        from ``review_failed`` (the rework edge that the cap guards).
+        """
+        if first:
+            transition(sid, "room-1", "assigned", caller_role="conductor", store=store)
+        transition(sid, "room-1", "in_progress", caller_role="coder", store=store)
+        transition(sid, "room-1", "verify_pending", caller_role="coder", store=store)
+        transition(sid, "room-1", "review_pending", caller_role="coder", store=store)
+        transition(sid, "room-1", "review_failed", caller_role="reviewer", store=store)
+
+    def _drive_to_cap(self, store, sid):
+        """Cycle ``sid`` to ``review_failed`` exactly ``MAX_REVIEW_ROUNDS`` times."""
+        self._fsm_cycle_to_review_failed(store, sid, first=True)          # round 1
+        for _ in range(MAX_REVIEW_ROUNDS - 1):                            # rounds 2..MAX
+            self._fsm_cycle_to_review_failed(store, sid, first=False)
+
+    # ── the crux: a progressing loop, bounded by the cap ─────────────────────
+
+    def test_progressing_loop_hits_cap_with_real_commits(self, tmp_path):
+        """A real commit every round (HEAD advances) — NOT a stall — and the cap
+        still rejects ``review_failed → in_progress`` at the cap, writing nothing.
+        Only ``review_failed → blocked`` is then legal."""
+        repo = _init_repo(tmp_path / "repo")
+        store = _new_store(tmp_path)
+        store.create_task("room-1", "demo", "room-1")
+
+        heads: list[str] = []
+
+        # Round 1: assign → … → review_failed, with a real commit.
+        self._fsm_cycle_to_review_failed(store, "st-cap", first=True)
+        heads.append(_commit_on(repo, "feat-cap", "round-1"))
+        assert store.get_subtask("st-cap").review_round == 1
+
+        # Rounds 2..MAX: rework is legal each time (count below cap), and every
+        # round lands a real commit so HEAD keeps moving.
+        for r in range(2, MAX_REVIEW_ROUNDS + 1):
+            self._fsm_cycle_to_review_failed(store, "st-cap", first=False)
+            heads.append(_commit_on(repo, "feat-cap", f"round-{r}"))
+            assert store.get_subtask("st-cap").review_round == r
+
+        # Every round advanced HEAD — this is a progressing loop, not a stall.
+        assert len(set(heads)) == len(heads) == MAX_REVIEW_ROUNDS
+
+        # At the cap, the rework edge is rejected with an ACTIONABLE error and
+        # NOTHING is written (no state change, no log row, count unchanged).
+        assert store.get_subtask("st-cap").state == "review_failed"
+        assert store.get_subtask("st-cap").review_round == MAX_REVIEW_ROUNDS
+        before = _log_count(store, "st-cap")
+        with pytest.raises(InvalidTransitionError) as exc:
+            transition("st-cap", "room-1", "in_progress", caller_role="coder",
+                       store=store)
+        message = str(exc.value).lower()
+        assert "cap" in message and "blocked" in message  # actionable: how to escape
+        assert store.get_subtask("st-cap").state == "review_failed"
+        assert store.get_subtask("st-cap").review_round == MAX_REVIEW_ROUNDS
+        assert _log_count(store, "st-cap") == before  # nothing written on rejection
+
+        # The legal escalation out of review_failed at the cap is → blocked.
+        transition("st-cap", "room-1", "blocked", caller_role="coder", store=store)
+        assert store.get_subtask("st-cap").state == "blocked"
+        assert _log_count(store, "st-cap") == before + 1
+
+    def test_configurable_cap_rejects_at_explicit_max(self, tmp_path):
+        """The cap is configurable: passing ``max_review_rounds=1`` bounds the
+        loop after a single failed review."""
+        store = _new_store(tmp_path)
+        store.create_task("room-1", "demo", "room-1")
+        self._fsm_cycle_to_review_failed(store, "st-1", first=True)  # round 1
+        assert store.get_subtask("st-1").review_round == 1
+
+        before = _log_count(store, "st-1")
+        with pytest.raises(InvalidTransitionError):
+            transition("st-1", "room-1", "in_progress", caller_role="coder",
+                       store=store, max_review_rounds=1)
+        assert _log_count(store, "st-1") == before  # nothing written
+
+        # The default cap (3) would still allow this rework — proving the bound
+        # came from the override, not the default.
+        transition("st-1", "room-1", "in_progress", caller_role="coder", store=store)
+        assert store.get_subtask("st-1").state == "in_progress"
+
+    # ── durability: the count survives a crash/reopen mid-loop ───────────────
+
+    def test_cap_survives_store_reopen(self, tmp_path):
+        """A crash mid-loop must not reset the cap: the durable count persists
+        across a fresh ``StateStore`` on the same DB file, and the cap still
+        fires after reopen."""
+        db_path = tmp_path / "state" / "orchestration.db"
+        store = StateStore(db_path)
+        store.create_task("room-1", "demo", "room-1")
+        self._drive_to_cap(store, "st-d")
+        assert store.get_subtask("st-d").review_round == MAX_REVIEW_ROUNDS
+
+        # Simulate a crash/restart: drop the handle, reopen the same file fresh.
+        del store
+        reopened = StateStore(db_path)
+        assert reopened.get_subtask("st-d").review_round == MAX_REVIEW_ROUNDS
+        assert reopened.get_subtask("st-d").state == "review_failed"
+
+        before = _log_count(reopened, "st-d")
+        with pytest.raises(InvalidTransitionError):
+            transition("st-d", "room-1", "in_progress", caller_role="coder",
+                       store=reopened)
+        assert _log_count(reopened, "st-d") == before          # nothing written
+        assert reopened.get_subtask("st-d").review_round == MAX_REVIEW_ROUNDS
+
+    # ── isolation: one subtask's cap does not affect another's counter ───────
+
+    def test_per_subtask_round_counters_are_independent(self, tmp_path):
+        """N concurrent subtasks each carry their own ``review_round``: one
+        hitting the cap leaves another's rework untouched."""
+        store = _new_store(tmp_path)
+        store.create_task("room-1", "demo", "room-1")
+
+        self._drive_to_cap(store, "st-capped")                       # → MAX
+        self._fsm_cycle_to_review_failed(store, "st-fresh", first=True)  # → 1
+        # A third, mid-loop, to show counters are tracked independently.
+        self._fsm_cycle_to_review_failed(store, "st-mid", first=True)
+        self._fsm_cycle_to_review_failed(store, "st-mid", first=False)   # → 2
+
+        assert store.get_subtask("st-capped").review_round == MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-fresh").review_round == 1
+        assert store.get_subtask("st-mid").review_round == 2
+
+        # The capped subtask rejects rework…
+        with pytest.raises(InvalidTransitionError):
+            transition("st-capped", "room-1", "in_progress", caller_role="coder",
+                       store=store)
+        # …while the others, below the cap, rework freely.
+        transition("st-fresh", "room-1", "in_progress", caller_role="coder",
+                   store=store)
+        transition("st-mid", "room-1", "in_progress", caller_role="coder", store=store)
+        assert store.get_subtask("st-fresh").state == "in_progress"
+        assert store.get_subtask("st-mid").state == "in_progress"
+        assert store.get_subtask("st-capped").state == "review_failed"
+
+    # ── independence: round cap and watchdog stall cap catch disjoint faults ──
+
+    async def test_round_cap_distinct_from_watchdog_stall_cap(self, tmp_path, monkeypatch):
+        """The watchdog (even with a tight stall cap) NEVER fires on a loop that
+        commits real code every round; the FSM round cap bounds that same loop.
+        Proves the two are separate mechanisms catching disjoint failures."""
+        repo = _init_repo(tmp_path / "repo")
+        _commit_on(repo, "feat-x", "seed")
+        _git(repo, "checkout", "main")
+        monkeypatch.chdir(repo)
+
+        store = _new_store(tmp_path)
+        store.create_task("room-1", "demo", "room-1")
+        store.ensure_subtask("st-x", "room-1", state="in_progress",
+                             metadata={"branch": "feat-x"})  # pr None → no gh
+
+        rest = _fake_rest()
+        # A deliberately TIGHT stall cap — it would fire on any 2-patrol stall.
+        daemon = WatchdogDaemon(
+            config=WatchdogConfig(max_phase_visits=2, git_progress_check=True),
+            rest_client=rest,
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+            state_store=store,
+        )
+        now = datetime.now(timezone.utc)
+
+        await daemon._check_subtask_progress(now)  # baseline
+
+        # First failed review (round 1).
+        transition("st-x", "room-1", "verify_pending", caller_role="coder", store=store)
+        transition("st-x", "room-1", "review_pending", caller_role="coder", store=store)
+        transition("st-x", "room-1", "review_failed", caller_role="reviewer", store=store)
+
+        # Each subsequent round: rework, a REAL commit (HEAD moves), a watchdog
+        # patrol (which therefore sees progress), then back to review_failed.
+        for r in range(2, MAX_REVIEW_ROUNDS + 1):
+            transition("st-x", "room-1", "in_progress", caller_role="coder", store=store)
+            _commit_on(repo, "feat-x", f"round-{r}")
+            _git(repo, "checkout", "main")
+            await daemon._check_subtask_progress(now)
+            transition("st-x", "room-1", "verify_pending", caller_role="coder",
+                       store=store)
+            transition("st-x", "room-1", "review_pending", caller_role="coder",
+                       store=store)
+            transition("st-x", "room-1", "review_failed", caller_role="reviewer",
+                       store=store)
+
+        # The watchdog never blocked it — HEAD advanced every patrol, so its
+        # stall counter kept resetting. This is the loop it cannot catch.
+        assert daemon._subtask_state["st-x"].patrol_visits_without_progress == 0
+        assert rest.agent_api_messages.create_agent_chat_message.await_count == 0
+        assert store.get_subtask("st-x").state == "review_failed"
+        assert store.get_subtask("st-x").review_round == MAX_REVIEW_ROUNDS
+
+        # …but the FSM round cap DOES bound the same progressing loop.
+        before = _log_count(store, "st-x")
+        with pytest.raises(InvalidTransitionError):
+            transition("st-x", "room-1", "in_progress", caller_role="coder",
+                       store=store)
+        assert _log_count(store, "st-x") == before
