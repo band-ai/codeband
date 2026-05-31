@@ -321,3 +321,117 @@ async def test_patrol_still_nudges_stale_agent_with_store(tmp_path, monkeypatch)
     rest.agent_api_messages.create_agent_chat_message.assert_awaited()
     sent = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
     assert "Status check" in sent.content
+
+
+# ── owner escalation on blocked (RFC P5 stage-1b wiring; dormant by default) ──
+
+def _seed_blocked(tmp_path, *, reason="verify-attempt cap 20 reached"):
+    """A real store with one subtask driven to ``blocked`` via the FSM.
+
+    Driving it through ``fsm.transition`` (not a bare ``ensure_subtask``) writes
+    a real ``→ blocked`` transition_log row carrying ``reason`` so the owner
+    escalation can surface it.
+    """
+    from codeband.state import StateStore
+    from codeband.state.fsm import transition
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID)
+    transition(SUBTASK_ID, TASK_ID, "assigned", caller_role="conductor", store=store)
+    transition(SUBTASK_ID, TASK_ID, "in_progress", caller_role="coder", store=store)
+    transition(SUBTASK_ID, TASK_ID, "blocked", caller_role="coder",
+               reason=reason, store=store)
+    return store
+
+
+def _owner_daemon(store, rest, *, owner_id="owner-1", owner_handle="Owner",
+                  activity=None):
+    from codeband.agents.watchdog import WatchdogDaemon
+
+    return WatchdogDaemon(
+        config=WatchdogConfig(),
+        rest_client=rest,
+        agent_id="agent-wd",
+        conductor_id="agent-cond",
+        activity=activity,
+        state_store=store,
+        owner_id=owner_id,
+        owner_handle=owner_handle,
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_subtask_escalates_to_owner_mention(tmp_path):
+    """A blocked subtask triggers a Band @mention to the owner carrying the
+    owner handle, the subtask id, and the durable blocked reason."""
+    store = _seed_blocked(tmp_path, reason="verify-attempt cap 20 reached")
+    rest = _mock_rest()
+    activity = MagicMock()
+    daemon = _owner_daemon(store, rest, owner_id="owner-1", owner_handle="Owner",
+                           activity=activity)
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+    call = rest.agent_api_messages.create_agent_chat_message.call_args
+    assert call.kwargs["chat_id"] == ROOM_ID
+    msg = call.kwargs["message"]
+    assert SUBTASK_ID in msg.content
+    assert "@Owner" in msg.content                       # owner handle in text
+    assert "verify-attempt cap 20 reached" in msg.content  # the durable reason
+    assert [m.id for m in msg.mentions] == ["owner-1"]   # structured mention
+    events = [c.args[0] for c in activity.log.call_args_list]
+    assert "SUBTASK_BLOCKED_OWNER_ESCALATION" in events
+
+
+@pytest.mark.asyncio
+async def test_owner_escalation_is_once_per_subtask(tmp_path):
+    """The owner is mentioned a single time even across repeated patrols."""
+    store = _seed_blocked(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+
+    now = datetime.now(UTC)
+    await daemon._check_blocked_subtasks(now)
+    await daemon._check_blocked_subtasks(now)
+    await daemon._check_blocked_subtasks(now)
+
+    assert rest.agent_api_messages.create_agent_chat_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_escalation_dormant_without_owner_id(tmp_path):
+    """With no owner_id (the pre-activation default), the path is a no-op."""
+    store = _seed_blocked(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id=None, owner_handle=None)
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owner_handle_falls_back_to_id(tmp_path):
+    """When no display handle is supplied, the owner id is used in the text."""
+    store = _seed_blocked(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id="owner-xyz", owner_handle=None)
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert "@owner-xyz" in msg.content
+    assert [m.id for m in msg.mentions] == ["owner-xyz"]
+
+
+@pytest.mark.asyncio
+async def test_non_blocked_subtasks_are_not_escalated(tmp_path):
+    """Only ``blocked`` subtasks escalate to the owner; in-flight ones do not."""
+    store = _seed_store(tmp_path, state="in_progress")  # not blocked
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
