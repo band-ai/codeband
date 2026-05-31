@@ -205,6 +205,43 @@ class TestVerifyCountDurability:
         assert reopened.get_subtask("st-1").state == "verify_pending"
 
 
+class TestNonCapTransitionErrorNotMisclassified:
+    """A non-cap ``InvalidTransitionError`` on ``review_failed → in_progress``
+    must NOT escalate to ``blocked`` with ``review_cap_reached``."""
+
+    def test_non_cap_error_does_not_block(self, tmp_path, monkeypatch, capsys):
+        from unittest.mock import patch as mock_patch
+
+        from codeband.state.fsm import InvalidTransitionError as ITE
+
+        project_dir, store = _project(tmp_path, verify_command="exit 0")
+        _seed_review_failed(store)
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+
+        assert store.get_subtask("st-1").review_round == 1
+        assert store.get_subtask("st-1").review_round < MAX_REVIEW_ROUNDS
+
+        original_transition = handoff.transition
+
+        def _failing_transition(subtask_id, task_id, new_state, **kwargs):
+            if new_state == "in_progress":
+                raise ITE("concurrent state mutation (simulated)")
+            return original_transition(subtask_id, task_id, new_state, **kwargs)
+
+        with mock_patch.object(handoff, "transition", side_effect=_failing_transition):
+            exit_code = _run_verify(project_dir, repo)
+
+        assert exit_code == 1
+        assert exit_code != handoff.EXIT_CAP_REACHED
+        sub = store.get_subtask("st-1")
+        assert sub.state == "review_failed"
+        assert sub.state != "blocked"
+        err = capsys.readouterr().err
+        assert "review_cap_reached" not in err
+        assert "transition rejected" in err
+
+
 class TestInvalidEntryState:
     """``cb-phase verify`` from an unexpected state prints error and exits 1."""
 
