@@ -27,6 +27,19 @@ verify loop — the coder commits real code each attempt, so git HEAD advances a
 the watchdog's stall cap by design never fires — mirroring the review-round cap
 in ``state/fsm.py`` on a different loop. This module imports **no Band SDK and no
 asyncio** — it is a fast, pure subprocess callable by both frameworks.
+
+Rejections are **structured and actionable** so an LLM (or telemetry) can route
+on them: every failure prints a stable, machine-greppable tag plus a concrete
+next step, and each failure mode exits with a distinct code.
+
+    REJECTED [dirty_tree]: <n> uncommitted files. Commit or stash, then re-run …
+    REJECTED [no_pr]: no open PR for branch <b>. Push and open a PR, then re-run.
+    REJECTED [verify_failed] (exit <code>): <last ~20 lines>. Fix and re-run.
+    BLOCKED [cap_reached]: <n> verify attempts. Escalated to human; stop and await.
+
+The tags (``dirty_tree`` / ``no_pr`` / ``verify_failed`` / ``cap_reached``) are
+part of the contract — they feed the verify-gate activation's telemetry later —
+so keep them stable.
 """
 
 from __future__ import annotations
@@ -54,6 +67,20 @@ from codeband.state.fsm import InvalidTransitionError, transition
 # ``MAX_REVIEW_ROUNDS`` (which counts ``review_failed`` re-entries — a subtask
 # stuck failing *verify* never reaches ``review_failed`` at all).
 MAX_VERIFY_ATTEMPTS = 20
+
+# Distinct exit codes per failure mode. ``cb-phase verify`` returns 0 on
+# success; each rejection returns its own non-zero code so a caller can branch
+# on the *kind* of failure without parsing stderr. These pair with the
+# ``REJECTED [<tag>]`` / ``BLOCKED [<tag>]`` lines and are part of the contract.
+EXIT_DIRTY_TREE = 2
+EXIT_NO_PR = 3
+EXIT_VERIFY_FAILED = 4
+EXIT_CAP_REACHED = 5
+
+# How many trailing lines of a failing verify command's output to surface in
+# the ``REJECTED [verify_failed]`` message — enough to see the failure without
+# dumping a whole test log into the chat relay.
+_VERIFY_OUTPUT_TAIL_LINES = 20
 
 
 def _resolve_store(project_dir: Path) -> StateStore:
@@ -85,16 +112,38 @@ def _max_verify_attempts(project_dir: Path) -> int:
     return load_config(project_dir).agents.max_verify_attempts
 
 
-def _git_tree_clean(worktree: Path) -> bool:
-    """Return ``True`` if ``git status --porcelain`` is empty in ``worktree``."""
+def _uncommitted_files(worktree: Path) -> list[str]:
+    """Return the porcelain status lines for ``worktree`` (empty == clean tree).
+
+    Each element is one ``git status --porcelain`` entry, so ``len(...)`` is the
+    count of uncommitted paths the ``dirty_tree`` message reports. A git failure
+    (e.g. not a repo) is surfaced as a single synthetic entry so the caller
+    treats the tree as un-verifiable — i.e. dirty — and rejects, exactly as the
+    previous boolean gate did on a non-zero return.
+    """
     result = subprocess.run(
         ["git", "-C", str(worktree), "status", "--porcelain"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        return False
-    return result.stdout.strip() == ""
+        return ["<git status unavailable>"]
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _current_branch(worktree: Path) -> str | None:
+    """Return the current branch name in ``worktree`` (or ``None`` if unknown).
+
+    Used only to make the ``no_pr`` rejection actionable ("…for branch <b>").
+    """
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
 
 
 def _pr_is_open(pr_number: int) -> bool:
@@ -112,23 +161,36 @@ def _pr_is_open(pr_number: int) -> bool:
         return False
 
 
-def _run_verify_command(command: str, cwd: Path) -> int:
-    """Run the configured verify command in ``cwd``; return its exit code."""
-    result = subprocess.run(command, shell=True, cwd=str(cwd))
-    return result.returncode
+def _run_verify_command(command: str, cwd: Path) -> tuple[int, str]:
+    """Run the configured verify command in ``cwd``.
+
+    Returns ``(exit_code, combined_output)`` — stdout and stderr captured
+    together so a failure's tail can be surfaced in the rejection message.
+    """
+    result = subprocess.run(
+        command, shell=True, cwd=str(cwd), capture_output=True, text=True,
+    )
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
-def _reject(store: StateStore, subtask_id: str, message: str) -> int:
-    """Record one rejected verify attempt and return the failure exit code.
+def _output_tail(output: str, lines: int = _VERIFY_OUTPUT_TAIL_LINES) -> str:
+    """Return the last ``lines`` non-empty lines of ``output`` as one string."""
+    kept = [line for line in output.splitlines() if line.strip()]
+    return "\n".join(kept[-lines:])
+
+
+def _reject(store: StateStore, subtask_id: str, message: str, exit_code: int) -> int:
+    """Record one rejected verify attempt and return its failure exit code.
 
     Bumps the subtask's durable ``verify_attempts`` (this is the *only* place a
-    rejection is counted), prints ``message`` to stderr, and returns ``1``. No
+    rejection is counted), prints the structured ``message`` to stderr, and
+    returns ``exit_code`` (a distinct non-zero per failure mode). No
     ``transition_log`` row is written — a rejection is a non-event for the FSM;
     only the cumulative attempt count advances.
     """
     store.increment_verify_attempts(subtask_id)
     print(message, file=sys.stderr)
-    return 1
+    return exit_code
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -158,37 +220,42 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
             return 1
         print(
-            f"cb-phase: verify-attempt cap {max_attempts} reached for subtask "
-            f"{args.subtask_id} ({attempts} rejected attempts); escalating to "
-            f"human — subtask → blocked.",
+            f"BLOCKED [cap_reached]: {attempts} verify attempts. "
+            "Escalated to human; stop and await.",
             file=sys.stderr,
         )
-        return 1
+        return EXIT_CAP_REACHED
 
-    if not _git_tree_clean(worktree):
+    dirty = _uncommitted_files(worktree)
+    if dirty:
         return _reject(
             store,
             args.subtask_id,
-            f"cb-phase: gate failed — working tree at {worktree} is not clean "
-            "(commit or stash changes before handoff).",
+            f"REJECTED [dirty_tree]: {len(dirty)} uncommitted files. "
+            "Commit or stash, then re-run cb-phase verify.",
+            EXIT_DIRTY_TREE,
         )
 
     if not _pr_is_open(args.pr):
+        branch = _current_branch(worktree) or f"PR #{args.pr}"
         return _reject(
             store,
             args.subtask_id,
-            f"cb-phase: gate failed — PR #{args.pr} is not OPEN.",
+            f"REJECTED [no_pr]: no open PR for branch {branch}. "
+            "Push and open a PR, then re-run.",
+            EXIT_NO_PR,
         )
 
     verify_command = _verify_command(project_dir)
     if verify_command:
-        code = _run_verify_command(verify_command, worktree)
+        code, output = _run_verify_command(verify_command, worktree)
         if code != 0:
+            tail = _output_tail(output)
             return _reject(
                 store,
                 args.subtask_id,
-                f"cb-phase: gate failed — verify command exited {code}: "
-                f"{verify_command!r}",
+                f"REJECTED [verify_failed] (exit {code}): {tail}. Fix and re-run.",
+                EXIT_VERIFY_FAILED,
             )
 
     try:
