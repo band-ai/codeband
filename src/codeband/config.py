@@ -223,6 +223,11 @@ class AgentsConfig(_StrictModel):
 
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
 
+    # Optional verify command run by the ``cb-phase`` handoff gate (RFC WS3).
+    # When set, the command must exit 0 before a subtask may advance to
+    # ``review_pending``. ``None`` skips the verify gate.
+    handoff_verify_command: str | None = None
+
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
         return (
