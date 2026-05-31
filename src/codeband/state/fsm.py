@@ -30,6 +30,19 @@ from contextlib import closing
 
 from codeband.state.store import StateStore, TERMINAL_STATES, _now_iso
 
+# Per-subtask review-round cap (RFC two-level model). A subtask may cycle
+# ``review_failed → in_progress → … → review_pending → review_failed`` at most
+# this many times; the next attempt to re-enter ``in_progress`` is rejected and
+# the only legal move becomes ``review_failed → blocked`` (escalation). This is
+# the *default*; callers (and ``config.AgentsConfig.max_review_rounds``) may
+# override it via the ``max_review_rounds`` argument to :func:`transition`.
+#
+# It is a DISTINCT mechanism from the watchdog's ``max_phase_visits`` stall cap:
+# that one fires on the *absence* of mechanical progress (no git-HEAD change, no
+# new transition), so it never trips on a loop that commits real code every
+# round. The review-round cap bounds exactly that productive-but-circular loop.
+MAX_REVIEW_ROUNDS = 3
+
 
 class InvalidTransitionError(Exception):
     """Raised when a requested transition is not permitted.
@@ -51,7 +64,12 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("in_progress", "coder"): frozenset({"verify_pending", "blocked"}),
     ("verify_pending", "coder"): frozenset({"review_pending"}),
     ("review_pending", "reviewer"): frozenset({"review_passed", "review_failed"}),
-    ("review_failed", "coder"): frozenset({"in_progress"}),
+    # A coder may rework a failed review (back to ``in_progress``) OR, once the
+    # review-round cap is hit, escalate the subtask to ``blocked`` — the same
+    # terminal-ish escalation outcome the watchdog produces on a stall. The
+    # ``in_progress`` edge is additionally guarded at runtime by the round cap
+    # in :func:`transition`; ``blocked`` is always available as the escape.
+    ("review_failed", "coder"): frozenset({"in_progress", "blocked"}),
     ("review_passed", "mergemaster"): frozenset({"merge_pending"}),
     ("merge_pending", "mergemaster"): frozenset({"merged"}),
 }
@@ -81,6 +99,7 @@ def transition(
     reason: str = "",
     *,
     store: StateStore,
+    max_review_rounds: int = MAX_REVIEW_ROUNDS,
 ) -> None:
     """Atomically advance a subtask to ``new_state``.
 
@@ -91,8 +110,22 @@ def transition(
     :class:`InvalidTransitionError` (writing nothing) on an illegal edge or a
     wrong caller role.
 
-    ``store`` is keyword-only so the positional signature matches the RFC while
-    still letting callers (and tests) inject the concrete store.
+    Two effects are intrinsic to the FSM (not the caller's responsibility):
+
+    * **Review-round counting.** Entering ``review_failed`` increments the
+      subtask's durable ``review_round`` in the same transaction — one failed
+      review is one round.
+    * **The review-round cap.** A ``review_failed → in_progress`` rework is
+      rejected once ``review_round`` has reached ``max_review_rounds``; the
+      subtask must instead go to ``blocked`` (escalation). The check reads the
+      committed count inside the exclusive transaction, so it is race-safe and
+      survives a crash/reopen (the count is durable). This bounds a productive
+      loop that the watchdog's stall cap never catches.
+
+    ``store`` and ``max_review_rounds`` are keyword-only so the positional
+    signature matches the RFC while still letting callers (and tests) inject the
+    concrete store and override the cap (e.g. from
+    ``config.AgentsConfig.max_review_rounds``).
     """
     store.ensure_subtask(subtask_id, task_id)
 
@@ -105,10 +138,12 @@ def transition(
         conn.execute("BEGIN EXCLUSIVE")
         try:
             row = conn.execute(
-                "SELECT state FROM subtask_states WHERE subtask_id = ?",
+                "SELECT state, review_round FROM subtask_states "
+                "WHERE subtask_id = ?",
                 (subtask_id,),
             ).fetchone()
             current_state = row["state"] if row is not None else "planned"
+            review_round = row["review_round"] if row is not None else 0
 
             if not _is_allowed(current_state, caller_role, new_state):
                 raise InvalidTransitionError(
@@ -116,12 +151,39 @@ def transition(
                     f"({current_state!r}, role={caller_role!r}) → {new_state!r}"
                 )
 
+            # Runtime cap guard: a rework cycle is only legal while the subtask
+            # has rounds left. At the cap, reject with an actionable error —
+            # ``blocked`` remains the legal escape (see VALID_TRANSITIONS).
+            if (
+                current_state == "review_failed"
+                and caller_role == "coder"
+                and new_state == "in_progress"
+                and review_round >= max_review_rounds
+            ):
+                raise InvalidTransitionError(
+                    f"Review-round cap reached for subtask {subtask_id!r}: "
+                    f"{review_round} of max {max_review_rounds} failed reviews. "
+                    "No further rework is permitted — escalate by transitioning "
+                    "this subtask to 'blocked'."
+                )
+
             now = _now_iso()
-            conn.execute(
-                "UPDATE subtask_states SET state = ?, updated_at = ? "
-                "WHERE subtask_id = ?",
-                (new_state, now, subtask_id),
-            )
+            # One failed review = one round. Increment on *entry* to
+            # review_failed so the cap reflects how many times this subtask has
+            # bounced back from review.
+            if new_state == "review_failed":
+                conn.execute(
+                    "UPDATE subtask_states "
+                    "SET state = ?, updated_at = ?, review_round = review_round + 1 "
+                    "WHERE subtask_id = ?",
+                    (new_state, now, subtask_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE subtask_states SET state = ?, updated_at = ? "
+                    "WHERE subtask_id = ?",
+                    (new_state, now, subtask_id),
+                )
             conn.execute(
                 "INSERT INTO transition_log "
                 "(subtask_id, from_state, to_state, caller_role, timestamp, reason) "

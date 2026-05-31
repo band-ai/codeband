@@ -237,6 +237,17 @@ class AgentsConfig(_StrictModel):
     # ``review_pending``. ``None`` skips the verify gate.
     handoff_verify_command: str | None = None
 
+    # Per-subtask review-round cap (RFC two-level model). Once a subtask has
+    # entered ``review_failed`` this many times, the FSM refuses to send it back
+    # to ``in_progress`` for another rework cycle — the only legal move is
+    # ``blocked`` (escalation). Bounds a *productive* review loop (real commits
+    # each round, HEAD advancing) that the watchdog's stall cap
+    # (``watchdog.max_phase_visits``) by design never fires on. Default 3 matches
+    # band-of-devs' ``max_phase_visits`` and the 2-3-round review plateau. Wired
+    # into ``fsm.transition`` via ``max_review_rounds`` (default
+    # ``fsm.MAX_REVIEW_ROUNDS``); the live caller lands with P5 activation.
+    max_review_rounds: int = 3
+
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
         return (

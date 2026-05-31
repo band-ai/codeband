@@ -40,7 +40,9 @@ def test_valid_transitions_matches_rfc_table():
         ("in_progress", "coder"): frozenset({"verify_pending", "blocked"}),
         ("verify_pending", "coder"): frozenset({"review_pending"}),
         ("review_pending", "reviewer"): frozenset({"review_passed", "review_failed"}),
-        ("review_failed", "coder"): frozenset({"in_progress"}),
+        # ``blocked`` is the coder's escalation escape once the review-round cap
+        # is hit (the ``in_progress`` rework is then gated at runtime).
+        ("review_failed", "coder"): frozenset({"in_progress", "blocked"}),
         ("review_passed", "mergemaster"): frozenset({"merge_pending"}),
         ("merge_pending", "mergemaster"): frozenset({"merged"}),
     }
