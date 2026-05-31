@@ -187,6 +187,58 @@ def test_pr_is_open_parses_state(monkeypatch):
     assert handoff._pr_is_open(7) is True
 
 
+# ── cb-phase start — seed the subtask lifecycle into in_progress ─────────────
+
+def _start(store, monkeypatch, subtask_id):
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    return handoff.main(["start", subtask_id, "--task", "room-1"])
+
+
+def test_start_creates_nonexistent_subtask_in_progress(store, monkeypatch, capsys):
+    # st-new does not exist yet — start must create it and land it in_progress.
+    assert store.get_subtask("st-new") is None
+    assert _start(store, monkeypatch, "st-new") == 0
+    assert store.get_subtask("st-new").state == "in_progress"
+    out = capsys.readouterr().out
+    assert "subtask st-new → in_progress (task room-1)." in out
+
+
+def test_start_is_idempotent(store, monkeypatch, capsys):
+    # Starting twice is a no-op the second time — never moves backward.
+    assert _start(store, monkeypatch, "st-new") == 0
+    assert _start(store, monkeypatch, "st-new") == 0
+    assert store.get_subtask("st-new").state == "in_progress"
+    assert "already at in_progress" in capsys.readouterr().out
+
+
+def test_start_non_regressing_on_verify_pending(store, monkeypatch, capsys):
+    # The `store` fixture leaves st-1 at verify_pending — start must not rewind.
+    assert _start(store, monkeypatch, "st-1") == 0
+    assert store.get_subtask("st-1").state == "verify_pending"
+    assert "already at verify_pending" in capsys.readouterr().out
+
+
+def test_start_non_regressing_on_review_failed(store, monkeypatch, capsys):
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    transition("st-1", "room-1", "review_failed", caller_role="reviewer", store=store)
+    assert _start(store, monkeypatch, "st-1") == 0
+    assert store.get_subtask("st-1").state == "review_failed"
+    assert "already at review_failed" in capsys.readouterr().out
+
+
+def test_start_from_assigned_walks_to_in_progress(monkeypatch, tmp_path, capsys):
+    s = StateStore(tmp_path / "state" / "orchestration.db")
+    s.create_task(task_id="room-1", description="demo", room_id="room-1")
+    transition("st-1", "room-1", "assigned", caller_role="conductor", store=s)
+    assert _start(s, monkeypatch, "st-1") == 0
+    assert s.get_subtask("st-1").state == "in_progress"
+
+
+def test_start_requires_task():
+    with pytest.raises(SystemExit):
+        handoff.main(["start", "st-1"])
+
+
 # ── cb-phase review — reviewer verdict routed through the FSM ────────────────
 
 def _review(verdict: str):

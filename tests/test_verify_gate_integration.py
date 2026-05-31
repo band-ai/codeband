@@ -4,6 +4,11 @@ Tests that ``cb-phase verify`` works from ``in_progress`` (first submit),
 ``review_failed`` (rework), and ``verify_pending`` (retry), walking only
 legal FSM edges. Also tests cap escalation from both entry paths.
 
+Also covers the lifecycle seam: ``cb-phase start`` seeds a subtask into
+``in_progress`` at pickup, and ``cb-phase verify`` self-seeds from a
+missing/``planned``/``assigned`` subtask so a skipped ``start`` degrades
+gracefully instead of dead-ending.
+
 Uses the same real-git + real-sqlite pattern as ``test_rails_integration.py``.
 """
 
@@ -66,6 +71,15 @@ def _run_verify(project_dir: Path, worktree: Path) -> int:
         "verify", "st-1",
         "--task", "room-1",
         "--pr", "42",
+        "--worktree", str(worktree),
+        "--project-dir", str(project_dir),
+    ])
+
+
+def _run_start(project_dir: Path, worktree: Path) -> int:
+    return handoff.main([
+        "start", "st-1",
+        "--task", "room-1",
         "--worktree", str(worktree),
         "--project-dir", str(project_dir),
     ])
@@ -242,12 +256,100 @@ class TestNonCapTransitionErrorNotMisclassified:
         assert "transition rejected" in err
 
 
-class TestInvalidEntryState:
-    """``cb-phase verify`` from an unexpected state prints error and exits 1."""
+class TestStartSeedsLifecycle:
+    """``cb-phase start`` seeds the subtask the Conductor never advances."""
 
-    def test_planned_state_rejected(self, tmp_path, monkeypatch, capsys):
+    def test_start_on_nonexistent_subtask_lands_in_progress(self, tmp_path):
         project_dir, store = _project(tmp_path)
-        store.ensure_subtask("st-1", "room-1")
+        repo = _init_repo(tmp_path / "repo")
+        assert store.get_subtask("st-1") is None
+
+        assert _run_start(project_dir, repo) == 0
+        assert store.get_subtask("st-1").state == "in_progress"
+
+    def test_start_is_idempotent_and_non_regressing(self, tmp_path):
+        project_dir, store = _project(tmp_path)
+        repo = _init_repo(tmp_path / "repo")
+
+        assert _run_start(project_dir, repo) == 0
+        assert _run_start(project_dir, repo) == 0  # twice → still in_progress
+        assert store.get_subtask("st-1").state == "in_progress"
+
+    def test_start_never_rewinds_a_later_state(self, tmp_path):
+        project_dir, store = _project(tmp_path)
+        repo = _init_repo(tmp_path / "repo")
+        _seed_review_failed(store)  # st-1 at review_failed (round 1)
+
+        assert _run_start(project_dir, repo) == 0
+        sub = store.get_subtask("st-1")
+        assert sub.state == "review_failed"  # not moved backward
+        assert sub.review_round == 1  # start touched no counters
+
+    def test_full_happy_path_start_then_verify(self, tmp_path, monkeypatch):
+        # start (pickup) → clean tree + open PR + passing verify → review_pending.
+        project_dir, store = _project(tmp_path, verify_command="exit 0")
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+
+        assert _run_start(project_dir, repo) == 0
+        assert store.get_subtask("st-1").state == "in_progress"
+        assert _run_verify(project_dir, repo) == 0
+        assert store.get_subtask("st-1").state == "review_pending"
+
+
+class TestVerifySelfSeedsFromMissingOrPlanned:
+    """REGRESSION: a skipped ``cb-phase start`` no longer dead-ends verify.
+
+    A missing/``planned``/``assigned`` subtask self-seeds to ``in_progress``,
+    then runs the existing gate — reaching ``review_pending`` (gate passes) or
+    ``verify_pending`` (gate rejects), never the old "not a valid entry state".
+    """
+
+    def test_verify_on_nonexistent_subtask_self_seeds_and_passes(
+        self, tmp_path, monkeypatch
+    ):
+        project_dir, store = _project(tmp_path, verify_command="exit 0")
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        assert store.get_subtask("st-1") is None  # nothing ran start
+
+        assert _run_verify(project_dir, repo) == 0
+        assert store.get_subtask("st-1").state == "review_pending"
+
+    def test_verify_on_planned_self_seeds_then_gate_rejects(
+        self, tmp_path, monkeypatch
+    ):
+        project_dir, store = _project(tmp_path)
+        store.ensure_subtask("st-1", "room-1")  # row exists at 'planned'
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
+
+        # Self-seeds past planned, runs the gate, lands at verify_pending — the
+        # gate's no_pr rejection, NOT the old "not a valid entry state" exit.
+        assert _run_verify(project_dir, repo) == handoff.EXIT_NO_PR
+        assert store.get_subtask("st-1").state == "verify_pending"
+
+    def test_verify_on_assigned_self_seeds_and_passes(self, tmp_path, monkeypatch):
+        project_dir, store = _project(tmp_path, verify_command="exit 0")
+        transition("st-1", "room-1", "assigned", caller_role="conductor", store=store)
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+
+        assert _run_verify(project_dir, repo) == 0
+        assert store.get_subtask("st-1").state == "review_pending"
+
+
+class TestInvalidEntryState:
+    """``cb-phase verify`` from a genuinely-invalid state still exits 1.
+
+    Self-seeding covers missing/planned/assigned; a state past the verify gate
+    with no legal walk back (e.g. ``blocked``) must still dead-end cleanly.
+    """
+
+    def test_blocked_state_rejected(self, tmp_path, monkeypatch, capsys):
+        project_dir, store = _project(tmp_path)
+        _seed_in_progress(store)
+        transition("st-1", "room-1", "blocked", caller_role="watchdog", store=store)
         repo = _init_repo(tmp_path / "repo")
 
         assert _run_verify(project_dir, repo) == 1
