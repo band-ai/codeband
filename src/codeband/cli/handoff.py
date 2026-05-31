@@ -6,6 +6,14 @@ if every gate passes, regardless of what the Conductor intended.
 
     cb-phase verify <subtask_id> --task <task_id> --pr <n> [--worktree <path>]
 
+A coder also runs ``cb-phase start <subtask_id> --task <task_id>`` at pickup to
+seed the subtask into ``in_progress`` — the Conductor never drives the FSM
+directly, so without this nothing would advance the subtask off ``planned`` and
+the first ``verify`` would dead-end. ``verify`` self-seeds from a
+missing/``planned``/``assigned`` subtask as a backstop, so a skipped ``start``
+degrades gracefully rather than failing. Neither path touches the gates that
+matter (``verify → review_pending``, the review verdict) or the cap counters.
+
 Gate sequence:
 
 0. **Verify-attempt cap.** If the subtask has already had
@@ -198,6 +206,67 @@ def _max_review_rounds(project_dir: Path) -> int:
     return load_config(project_dir).agents.max_review_rounds
 
 
+# States from which ``cb-phase start`` (and verify's self-seed) walks the
+# subtask up to ``in_progress``. A missing subtask reads as ``planned``. Any
+# other state is already underway, escalated, or terminal: start is a no-op
+# there and must never move it backward.
+_PRE_START_STATES = frozenset({"planned", "assigned"})
+
+
+def _walk_to_in_progress(
+    subtask_id: str,
+    task_id: str,
+    store: StateStore,
+) -> tuple[str, int | None]:
+    """Bring a subtask to ``in_progress``, walking only legal FSM edges.
+
+    Seeds the lifecycle the Conductor never drives directly: a missing subtask
+    is auto-created (``transition`` calls ``ensure_subtask``) and walked
+    ``planned → assigned → in_progress`` using the caller role each edge
+    requires (``conductor`` for ``planned → assigned``, ``coder`` for
+    ``assigned → in_progress``). This registers "work began"; it touches none
+    of the gates that matter (verify → review_pending, the review verdict) and
+    none of the verify-attempt / review-round counters.
+
+    Returns ``(state, error_code)``. ``error_code`` is ``None`` on success and
+    ``state`` is the resulting state — ``in_progress`` after a walk, or the
+    subtask's current state when it was already at/past ``in_progress``
+    (idempotent, non-regressing). A non-``None`` ``error_code`` means a
+    transition was rejected and the caller should return it.
+    """
+    subtask = store.get_subtask(subtask_id)
+    current = subtask.state if subtask is not None else "planned"
+
+    # Already underway, escalated, or terminal — never move backward.
+    if current not in _PRE_START_STATES:
+        return current, None
+
+    if current == "planned":
+        try:
+            transition(
+                subtask_id, task_id, "assigned",
+                caller_role="conductor",
+                reason="cb-phase start: seed planned → assigned",
+                store=store,
+            )
+        except InvalidTransitionError as exc:
+            print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+            return current, 1
+        current = "assigned"
+
+    try:
+        transition(
+            subtask_id, task_id, "in_progress",
+            caller_role="coder",
+            reason="cb-phase start: assigned → in_progress (work began)",
+            store=store,
+        )
+    except InvalidTransitionError as exc:
+        print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+        return current, 1
+    return "in_progress", None
+
+
 def _walk_to_verify_pending(
     subtask_id: str,
     task_id: str,
@@ -212,6 +281,10 @@ def _walk_to_verify_pending(
 
     Legal entry states:
 
+    * *missing* / ``planned`` / ``assigned`` — a skipped ``cb-phase start``.
+      Self-seed the subtask up to ``in_progress`` first (start's path), then
+      fall through to the ``in_progress`` walk. This is the backstop that keeps
+      a first verify from dead-ending when nothing ran ``start``.
     * ``verify_pending`` — already there, no transitions needed.
     * ``in_progress`` — walk ``in_progress → verify_pending``.
     * ``review_failed`` — check the review-round cap first; if at cap,
@@ -222,6 +295,15 @@ def _walk_to_verify_pending(
     """
     subtask = store.get_subtask(subtask_id)
     current = subtask.state if subtask is not None else "planned"
+
+    # Backstop for a skipped ``cb-phase start``: a missing/planned/assigned
+    # subtask self-seeds up to in_progress, then runs the existing gate exactly
+    # as today. This never touches the verify-attempt or review-round counters.
+    if current in _PRE_START_STATES:
+        seeded, error_code = _walk_to_in_progress(subtask_id, task_id, store)
+        if error_code is not None:
+            return error_code
+        current = seeded
 
     if current == "verify_pending":
         return None
@@ -388,6 +470,42 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_start(args: argparse.Namespace) -> int:
+    """Seed a subtask into ``in_progress`` at coder pickup.
+
+    Marks "work began" on the subtask the Conductor never advances directly,
+    walking ``planned → assigned → in_progress`` (auto-creating the row if it
+    does not yet exist). Idempotent and non-regressing: a subtask already at or
+    past ``in_progress`` is reported and left untouched. No PR exists yet at
+    start, so no gate runs — the gates that matter (verify → review_pending,
+    the review verdict) stay downstream and untouched.
+    """
+    project_dir = Path(args.project_dir).resolve()
+    store = _resolve_store(project_dir)
+
+    # Was the subtask already underway/past before we touched it? Only a subtask
+    # that is missing/planned/assigned is actually moved by start; anything else
+    # is a non-regressing no-op and is reported as such.
+    pre = store.get_subtask(args.subtask_id)
+    already_underway = pre is not None and pre.state not in _PRE_START_STATES
+
+    state, error_code = _walk_to_in_progress(args.subtask_id, args.task, store)
+    if error_code is not None:
+        return error_code
+
+    if already_underway:
+        print(
+            f"cb-phase: subtask {args.subtask_id} already at {state} "
+            f"(task {args.task}); start is a no-op."
+        )
+    else:
+        print(
+            f"cb-phase: subtask {args.subtask_id} → in_progress "
+            f"(task {args.task})."
+        )
+    return 0
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     """Record a reviewer's verdict on a ``review_pending`` subtask via the FSM.
 
@@ -432,6 +550,24 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Verify-gated phase handoffs for codeband subtasks.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    start = sub.add_parser(
+        "start",
+        help="Seed a subtask into in_progress at coder pickup (no PR yet).",
+    )
+    start.add_argument("subtask_id", help="Subtask identifier.")
+    start.add_argument("--task", required=True, help="Task identifier (room_id).")
+    start.add_argument(
+        "--worktree",
+        default=".",
+        help="Path to the git worktree (default: cwd).",
+    )
+    start.add_argument(
+        "--project-dir",
+        default=".",
+        help="Project directory containing codeband.yaml (default: cwd).",
+    )
+    start.set_defaults(func=_cmd_start)
 
     verify = sub.add_parser(
         "verify",

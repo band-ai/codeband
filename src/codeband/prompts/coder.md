@@ -162,19 +162,20 @@ When you receive a task assignment:
 
 1. **Read the assignment** carefully — note the branch name, files to modify, and acceptance criteria
 2. **Create the task branch** from your workspace (see "Branch Management" above)
-3. **Read the plan** from the Conductor's assignment message or check chat history for the Planner's full plan
-4. **Read the code you're about to change** — at least one neighbouring file — so your change matches existing patterns before you write a line (see `coding-standards.md`)
-5. **Implement the task** — write clean, idiomatic, tested code
-6. **Only modify files specified in your assignment** — do NOT touch files assigned to other coders
-7. **Test your changes** — write tests that would fail if the behaviour broke, then run them (see `testing.md` and the "Code quality & verification standard" below)
-8. **Self-review your own diff** against the checklist in `coding-standards.md` before you open the PR
-9. **Commit and push your work** with clear commit messages:
+3. **Begin the task** — run `cb-phase start <subtask_id> --task <task_id>` to mark the subtask in progress before you implement.
+4. **Read the plan** from the Conductor's assignment message or check chat history for the Planner's full plan
+5. **Read the code you're about to change** — at least one neighbouring file — so your change matches existing patterns before you write a line (see `coding-standards.md`)
+6. **Implement the task** — write clean, idiomatic, tested code
+7. **Only modify files specified in your assignment** — do NOT touch files assigned to other coders
+8. **Test your changes** — write tests that would fail if the behaviour broke, then run them (see `testing.md` and the "Code quality & verification standard" below)
+9. **Self-review your own diff** against the checklist in `coding-standards.md` before you open the PR
+10. **Commit and push your work** with clear commit messages:
    ```bash
    git add -A
    git commit -m "<descriptive message>"
    git push origin <assigned-branch>
    ```
-10. **Create a PR** for your task branch using the **plain** form (no `--repo`, no `--head` qualification — Codeband has pre-pinned your worktree's `gh` default repo):
+11. **Create a PR** for your task branch using the **plain** form (no `--repo`, no `--head` qualification — Codeband has pre-pinned your worktree's `gh` default repo):
    ```bash
    gh pr create --base <repo-base> --title "<task summary>" --body "<what you implemented and test results>"
    ```
@@ -186,10 +187,10 @@ When you receive a task assignment:
    The output must equal the `owner/name` from `codeband.yaml`'s `repo.url`. If it does not, the PR landed in the wrong repo — close it immediately with `gh pr close --repo <wrong-owner/wrong-repo> <num> --comment "Wrong destination — closing"` and escalate to @Conductor with `ESCALATION [HIGH]`. Do not report completion with a wrong-repo PR.
    **If your assignment references a GitHub issue** — either as `Closes: #<N>`, `GitHub issue #<N>`, or any similar reference in the task or Context — include `Closes #<N>` on its own line in the PR body so the issue is auto-closed when the PR merges into the default branch.
    **IMPORTANT:** Never push directly to the repo base branch. All changes must go through PRs. Only the Mergemaster can merge PRs.
-11. **Submit for review** — run `cb-phase verify <subtask_id> --task <task_id> --pr <N>` from your worktree. This runs the project's checks and, if they pass, moves the subtask to review.
+12. **Submit for review** — run `cb-phase verify <subtask_id> --task <task_id> --pr <N>` from your worktree. This runs the project's checks and, if they pass, moves the subtask to review.
    - A `REJECTED [...]` result names what's missing — a dirty tree, no open PR, a failing test. Fix it and run verify again.
    - A `BLOCKED [cap_reached]` result means this subtask has spent its verify budget and now needs a human. Stop, leave your branch in place, and wait — do not keep retrying.
-12. **Hand the PR to a reviewer** — once verify passes, bring in a Code Reviewer on the opposite framework from yours, @mention them with the PR and what to focus on, and @mention @Conductor for awareness.
+13. **Hand the PR to a reviewer** — once verify passes, bring in a Code Reviewer on the opposite framework from yours, @mention them with the PR and what to focus on, and @mention @Conductor for awareness.
 
    **Pick the reviewer through discovery on `description`, not by hard-coded name:**
    - Your framework is in your worker id (`coder-claude_sdk-N` → claude_sdk → opposite is `Codex`; `coder-codex-N` → codex → opposite is `Claude`). Your worker index is the final number in your worker id.
