@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from codeband.models import CLAUDE_OPUS
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROMPT = Path(__file__).parent.parent / "prompts" / "coder.md"
@@ -21,11 +23,12 @@ class ClaudePlayerRunner:
     def __init__(
         self,
         *,
-        model: str = "claude-opus-4-7",
+        model: str = CLAUDE_OPUS,
         custom_prompt: str | None = None,
         workspace: str | None = None,
         recovery_context: str | None = None,
         worker_roster: str | None = None,
+        identity_section: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
@@ -35,6 +38,8 @@ class ClaudePlayerRunner:
         prompt = custom_prompt or load_prompt(_DEFAULT_PROMPT)
         if worker_roster:
             prompt += f"\n\n{worker_roster}"
+        if identity_section:
+            prompt += f"\n\n{identity_section}"
         if recovery_context:
             prompt = f"{recovery_context}\n\n---\n\n{prompt}"
 

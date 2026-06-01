@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from codeband.models import CLAUDE_SONNET, CODEX_GPT
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROMPT = Path(__file__).parent.parent / "prompts" / "code_reviewer.md"
@@ -21,10 +23,11 @@ class CodexCodeReviewerRunner:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4",
+        model: str = CODEX_GPT,
         custom_prompt: str | None = None,
         review_guidelines: str | None = None,
         workspace: str | None = None,
+        identity_section: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -39,6 +42,8 @@ class CodexCodeReviewerRunner:
         from codeband.agents.prompts import build_review_prompt
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        if identity_section:
+            prompt += f"\n\n{identity_section}"
         config = CodexAdapterConfig(
             model=model,
             system_prompt=prompt,
@@ -66,16 +71,19 @@ class ClaudeCodeReviewerRunner:
     def __init__(
         self,
         *,
-        model: str = "claude-sonnet-4-6",
+        model: str = CLAUDE_SONNET,
         custom_prompt: str | None = None,
         review_guidelines: str | None = None,
         workspace: str | None = None,
+        identity_section: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
         from codeband.agents.prompts import build_review_prompt
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        if identity_section:
+            prompt += f"\n\n{identity_section}"
         self._adapter = ClaudeSDKAdapter(
             model=model,
             custom_section=prompt,

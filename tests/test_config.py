@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from codeband.config import (
     AgentConfigFile,
     AgentCredentials,
     AgentsConfig,
+    ClaudeConfig,
     CodebandConfig,
     ConductorConfig,
     DeploymentMode,
@@ -49,8 +51,8 @@ class TestCodebandConfig:
         on Sonnet for better cost/latency.
         """
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
-        assert config.agents.coders.claude_sdk.model == "claude-opus-4-7"
-        assert config.agents.coders.codex.model == "gpt-5.4"
+        assert config.agents.coders.claude_sdk.model == "claude-opus-4-8"
+        assert config.agents.coders.codex.model == "gpt-5.5"
         assert config.agents.reviewers.claude_sdk.model == "claude-sonnet-4-6"
         assert config.agents.planners.claude_sdk.model == "claude-sonnet-4-6"
         assert config.agents.conductor.model == "claude-sonnet-4-6"
@@ -77,13 +79,13 @@ class TestCodebandConfig:
             repo=RepoConfig(url="https://github.com/a/b.git"),
             agents=AgentsConfig(
                 coders=FrameworkPool(
-                    claude_sdk=PoolEntry(count=3, model="claude-opus-4-7"),
+                    claude_sdk=PoolEntry(count=3, model="claude-opus-4-8"),
                     codex=PoolEntry(count=0),
                 ),
             ),
         )
         assert config.agents.coders.claude_sdk.count == 3
-        assert config.agents.coders.claude_sdk.model == "claude-opus-4-7"
+        assert config.agents.coders.claude_sdk.model == "claude-opus-4-8"
         assert config.agents.coders.codex.count == 0
         assert config.agents.coders.active_frameworks() == [Framework.CLAUDE_SDK]
 
@@ -313,7 +315,7 @@ class TestScalePool:
             repo=RepoConfig(url="https://github.com/a/b.git"),
             agents=AgentsConfig(
                 coders=FrameworkPool(
-                    claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
+                    claude_sdk=PoolEntry(count=1, model="claude-opus-4-8"),
                 ),
             ),
         )
@@ -321,7 +323,7 @@ class TestScalePool:
         config.to_yaml(path)
 
         updated = scale_pool(path, "coders", Framework.CLAUDE_SDK, 3)
-        assert updated.agents.coders.claude_sdk.model == "claude-opus-4-7"
+        assert updated.agents.coders.claude_sdk.model == "claude-opus-4-8"
         assert updated.agents.coders.claude_sdk.count == 3
 
     def test_negative_count_rejected(self, tmp_path: Path):
@@ -373,7 +375,7 @@ class TestConductorConfig:
             agents=AgentsConfig(
                 conductor=ConductorConfig(
                     framework=Framework.CLAUDE_SDK,
-                    model="claude-opus-4-7",
+                    model="claude-opus-4-8",
                 ),
             ),
         )
@@ -381,7 +383,7 @@ class TestConductorConfig:
         config.to_yaml(yaml_path)
         loaded = CodebandConfig.from_yaml(yaml_path)
         assert loaded.agents.conductor.framework == Framework.CLAUDE_SDK
-        assert loaded.agents.conductor.model == "claude-opus-4-7"
+        assert loaded.agents.conductor.model == "claude-opus-4-8"
 
 
 class TestCodexFrameworkSupport:
@@ -398,11 +400,11 @@ class TestCodexFrameworkSupport:
         cfg = AgentsConfig(
             planners=FrameworkPool(
                 claude_sdk=PoolEntry(count=0),
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
         )
         assert cfg.planners.codex.count == 1
-        assert cfg.planners.codex.model == "gpt-5.4"
+        assert cfg.planners.codex.model == "gpt-5.5"
 
     def test_planners_claude_only_still_fine(self):
         """The default shape (Claude planner, Codex plan-reviewer) keeps working."""
@@ -459,3 +461,44 @@ class TestMergemasterConfig:
         config.to_yaml(yaml_path)
         loaded = CodebandConfig.from_yaml(yaml_path)
         assert loaded.agents.mergemaster.review_guidelines == "Must have tests"
+
+
+class TestClaudeConfig:
+    """Claude auth policy — API-key-first by default, subscription as opt-in."""
+
+    def test_default_is_api_key(self):
+        config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
+        assert config.claude.auth_mode == "api_key"
+
+    def test_legacy_config_without_claude_block_loads(self, tmp_path: Path):
+        """Existing codeband.yaml files predate the `claude:` block."""
+        yaml_path = tmp_path / "codeband.yaml"
+        yaml_path.write_text(
+            "repo:\n  url: https://github.com/a/b.git\n", encoding="utf-8",
+        )
+        loaded = CodebandConfig.from_yaml(yaml_path)
+        assert loaded.claude.auth_mode == "api_key"
+
+    def test_subscription_roundtrip(self, tmp_path: Path):
+        config = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/a/b.git"),
+            claude=ClaudeConfig(auth_mode="subscription"),
+        )
+        yaml_path = tmp_path / "codeband.yaml"
+        config.to_yaml(yaml_path)
+        loaded = CodebandConfig.from_yaml(yaml_path)
+        assert loaded.claude.auth_mode == "subscription"
+
+    def test_init_default_yaml_emits_api_key(self, tmp_path: Path):
+        """A freshly written default config persists auth_mode: api_key."""
+        config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
+        yaml_path = tmp_path / "codeband.yaml"
+        config.to_yaml(yaml_path)
+        assert "auth_mode: api_key" in yaml_path.read_text(encoding="utf-8")
+
+    def test_invalid_auth_mode_rejected(self):
+        with pytest.raises(pydantic.ValidationError):
+            CodebandConfig.model_validate({
+                "repo": {"url": "https://github.com/a/b.git"},
+                "claude": {"auth_mode": "subscriptions"},
+            })

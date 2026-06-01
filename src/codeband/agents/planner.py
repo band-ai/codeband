@@ -5,18 +5,26 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from codeband.models import CLAUDE_SONNET, CODEX_GPT
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROMPT = Path(__file__).parent.parent / "prompts" / "planner.md"
 
 
-def _build_prompt(custom_prompt: str | None, worker_roster: str | None) -> str:
+def _build_prompt(
+    custom_prompt: str | None,
+    worker_roster: str | None,
+    identity_section: str | None = None,
+) -> str:
     """Compose the system prompt — shared by both framework runners."""
     from codeband.agents.prompts import load_prompt
 
     prompt = custom_prompt or load_prompt(_DEFAULT_PROMPT)
     if worker_roster:
         prompt += f"\n\n{worker_roster}"
+    if identity_section:
+        prompt += f"\n\n{identity_section}"
     return prompt
 
 
@@ -32,14 +40,15 @@ class ClaudePlannerRunner:
     def __init__(
         self,
         *,
-        model: str = "claude-sonnet-4-6",
+        model: str = CLAUDE_SONNET,
         custom_prompt: str | None = None,
         workspace: str | None = None,
         worker_roster: str | None = None,
+        identity_section: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
-        prompt = _build_prompt(custom_prompt, worker_roster)
+        prompt = _build_prompt(custom_prompt, worker_roster, identity_section)
 
         # `dontAsk` is a bundled Claude CLI mode not yet in the SDK's
         # PermissionMode Literal, but forwarded verbatim via --permission-mode.
@@ -75,10 +84,11 @@ class CodexPlannerRunner:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4",
+        model: str = CODEX_GPT,
         custom_prompt: str | None = None,
         workspace: str | None = None,
         worker_roster: str | None = None,
+        identity_section: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -90,7 +100,7 @@ class CodexPlannerRunner:
                 "Codex support."
             ) from e
 
-        prompt = _build_prompt(custom_prompt, worker_roster)
+        prompt = _build_prompt(custom_prompt, worker_roster, identity_section)
         config = CodexAdapterConfig(
             model=model,
             system_prompt=prompt,

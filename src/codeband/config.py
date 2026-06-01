@@ -9,6 +9,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from codeband.models import CLAUDE_OPUS, CLAUDE_SONNET, CODEX_GPT
+
 # Reject unknown fields by default. Catches YAML indentation bugs (e.g.
 # `agents:` nested under `repo:` instead of at top level) that would
 # otherwise be silently ignored, leaving the user running with defaults
@@ -47,7 +49,7 @@ class ConductorConfig(_StrictModel):
     """Configuration for the conductor agent (single-instance coordinator)."""
 
     framework: Framework = Framework.CLAUDE_SDK
-    model: str = "claude-sonnet-4-6"
+    model: str = CLAUDE_SONNET
 
 
 class AutoMergePolicy(str, Enum):
@@ -63,7 +65,7 @@ class MergemasterConfig(_StrictModel):
     """Configuration for the mergemaster agent (single-instance coordinator)."""
 
     framework: Framework = Framework.CLAUDE_SDK
-    model: str = "claude-sonnet-4-6"
+    model: str = CLAUDE_SONNET
     test_command: str | None = None
     review_guidelines: str | None = None
     auto_merge: AutoMergePolicy = AutoMergePolicy.LOW
@@ -180,13 +182,13 @@ class PlanReviewersConfig(ReviewersConfig):
 
 def _default_planners_pool() -> FrameworkPool:
     return FrameworkPool(
-        claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
+        claude_sdk=PoolEntry(count=1, model=CLAUDE_SONNET),
     )
 
 
 def _default_plan_reviewers_pool() -> PlanReviewersConfig:
     return PlanReviewersConfig(
-        codex=PoolEntry(count=1, model="gpt-5.4"),
+        codex=PoolEntry(count=1, model=CODEX_GPT),
     )
 
 
@@ -196,15 +198,15 @@ def _default_coders_pool() -> FrameworkPool:
     # mergemaster stay on Sonnet, which is a better cost/latency fit for
     # their lighter workloads.
     return FrameworkPool(
-        claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
-        codex=PoolEntry(count=1, model="gpt-5.4"),
+        claude_sdk=PoolEntry(count=1, model=CLAUDE_OPUS),
+        codex=PoolEntry(count=1, model=CODEX_GPT),
     )
 
 
 def _default_reviewers_pool() -> ReviewersConfig:
     return ReviewersConfig(
-        claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
-        codex=PoolEntry(count=1, model="gpt-5.4"),
+        claude_sdk=PoolEntry(count=1, model=CLAUDE_SONNET),
+        codex=PoolEntry(count=1, model=CODEX_GPT),
     )
 
 
@@ -262,6 +264,22 @@ class BandConfig(_StrictModel):
     liveness_mode: Literal["auto", "human", "agent"] = "auto"
 
 
+class ClaudeConfig(_StrictModel):
+    """Claude authentication policy.
+
+    ``api_key`` (default): authenticate with ``ANTHROPIC_API_KEY`` (Anthropic
+    Commercial Terms — the supported path for automated, parallel agents).
+    Subscription OAuth is never used automatically.
+
+    ``subscription``: deliberately opt into Claude Pro/Max OAuth. Codeband
+    strips ``ANTHROPIC_API_KEY`` so the Claude CLI bills the subscription,
+    keeping the key as a usage-limit fallback. Anthropic's Consumer Terms
+    restrict automated subscription use — see ``docs/AUTHENTICATION.md``.
+    """
+
+    auth_mode: Literal["api_key", "subscription"] = "api_key"
+
+
 class CodebandConfig(_StrictModel):
     """Root configuration for a Codeband project."""
 
@@ -269,6 +287,7 @@ class CodebandConfig(_StrictModel):
     agents: AgentsConfig = AgentsConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
     band: BandConfig = BandConfig()
+    claude: ClaudeConfig = ClaudeConfig()
 
     @classmethod
     def from_yaml(cls, path: Path) -> CodebandConfig:

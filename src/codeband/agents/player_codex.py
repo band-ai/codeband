@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from codeband.models import CODEX_GPT
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROMPT = Path(__file__).parent.parent / "prompts" / "coder.md"
@@ -23,11 +25,12 @@ class CodexPlayerRunner:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4",
+        model: str = CODEX_GPT,
         custom_prompt: str | None = None,
         workspace: str | None = None,
         recovery_context: str | None = None,
         worker_roster: str | None = None,
+        identity_section: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -45,6 +48,8 @@ class CodexPlayerRunner:
         prompt = custom_prompt or load_prompt(_DEFAULT_PROMPT)
         if worker_roster:
             prompt += f"\n\n{worker_roster}"
+        if identity_section:
+            prompt += f"\n\n{identity_section}"
         if recovery_context:
             prompt = f"{recovery_context}\n\n---\n\n{prompt}"
 
