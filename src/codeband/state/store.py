@@ -64,10 +64,15 @@ class TaskRow:
     created_at: str
     status: str = "active"
     # Band participant id of the task initiator (whoever held BAND_API_KEY at
-    # kickoff). Nullable — predates the column on older DBs and may be unresolved
-    # if the profile lookup failed. The watchdog reads it to @mention the
+    # kickoff, or whoever seeded the room via ``cb register-task``). Nullable —
+    # predates the column on older DBs. The watchdog reads it to @mention the
     # initiator when one of the subtask's caps trips it into ``blocked``.
+    # ``register_task`` (state/registration.py) requires it on every new row.
     owner_id: str | None = None
+    # Human-readable handle/display name for the owner (e.g. a jam bridge
+    # handle like ``yoni/claude-lyra-5ebd4a``). Informational only — mentions
+    # use ``owner_id``; nullable like ``owner_id`` and for the same reasons.
+    owner_handle: str | None = None
 
 
 @dataclass
@@ -100,12 +105,13 @@ class SubtaskRow:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
-    task_id     TEXT PRIMARY KEY,
-    description TEXT NOT NULL,
-    room_id     TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'active',
-    owner_id    TEXT
+    task_id      TEXT PRIMARY KEY,
+    description  TEXT NOT NULL,
+    room_id      TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active',
+    owner_id     TEXT,
+    owner_handle TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subtask_states (
@@ -216,6 +222,8 @@ class StateStore:
         }
         if "owner_id" not in task_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN owner_id TEXT")
+        if "owner_handle" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN owner_handle TEXT")
 
     # ── tasks ──────────────────────────────────────────────────────────────
 
@@ -248,6 +256,59 @@ class StateStore:
                     owner_id,
                 ),
             )
+
+    def register_task_atomic(
+        self,
+        *,
+        task_id: str,
+        description: str,
+        room_id: str,
+        owner_id: str,
+        owner_handle: str | None = None,
+        supersede_task_id: str | None = None,
+    ) -> str:
+        """Apply one task registration's DB mutations in a single transaction.
+
+        Status-update + upsert support for ``register_task``
+        (``state/registration.py``) — the supersede of the previously active
+        task and the insert/update of the registered one must land atomically,
+        so a crash between them cannot leave two active tasks or none:
+
+        * If ``supersede_task_id`` is given, that row's status is set to
+          ``'superseded'`` (idempotent UPDATE; a missing row is a no-op).
+        * If a row for ``task_id`` already exists, only ``owner_id`` /
+          ``owner_handle`` are updated — description, status and created_at
+          are deliberately left untouched (re-registration changes ownership,
+          not history).
+        * Otherwise a fresh ``'active'`` row is inserted.
+
+        Returns ``"inserted"`` or ``"updated"`` so the caller can report the
+        outcome without a second read.
+        """
+        with self._transaction() as conn:
+            if supersede_task_id is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = 'superseded' WHERE task_id = ?",
+                    (supersede_task_id,),
+                )
+            existing = conn.execute(
+                "SELECT task_id FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if existing is not None:
+                conn.execute(
+                    "UPDATE tasks SET owner_id = ?, owner_handle = ? "
+                    "WHERE task_id = ?",
+                    (owner_id, owner_handle, task_id),
+                )
+                return "updated"
+            conn.execute(
+                "INSERT INTO tasks "
+                "(task_id, description, room_id, created_at, status, "
+                "owner_id, owner_handle) "
+                "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+                (task_id, description, room_id, _now_iso(), owner_id, owner_handle),
+            )
+            return "inserted"
 
     def get_task(self, task_id: str) -> TaskRow | None:
         """Return the task row, or ``None`` if it does not exist."""
@@ -352,16 +413,18 @@ class StateStore:
 
 
 def _task_from_row(row: sqlite3.Row) -> TaskRow:
-    # ``owner_id`` may be absent on rows fetched before the migration ran (or in
-    # a hand-built row in tests); tolerate its absence rather than KeyError.
-    owner_id = row["owner_id"] if "owner_id" in row.keys() else None
+    # ``owner_id`` / ``owner_handle`` may be absent on rows fetched before the
+    # migration ran (or in a hand-built row in tests); tolerate their absence
+    # rather than KeyError.
+    keys = row.keys()
     return TaskRow(
         task_id=row["task_id"],
         description=row["description"],
         room_id=row["room_id"],
         created_at=row["created_at"],
         status=row["status"],
-        owner_id=owner_id,
+        owner_id=row["owner_id"] if "owner_id" in keys else None,
+        owner_handle=row["owner_handle"] if "owner_handle" in keys else None,
     )
 
 
