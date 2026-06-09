@@ -348,6 +348,10 @@ class TestSendTask:
         human_client.human_api_chats.create_my_chat_room.return_value = FakeRoomResponse(
             data=FakeRoom(id="room-123")
         )
+        # Owner resolution is required: send_task aborts without a profile id.
+        human_client.human_api_profile.get_my_profile.return_value = FakeIdentityResponse(
+            data=FakeIdentity(id="owner-1", name="Initiator")
+        )
         human_client.human_api_participants.add_my_chat_participant = AsyncMock()
         human_client.human_api_messages.send_my_chat_message = AsyncMock()
         human_client.human_api_chats.list_my_chats.return_value = FakeListResponse(data=[])
@@ -405,6 +409,10 @@ class TestSendTask:
         human_client = AsyncMock()
         human_client.human_api_chats.create_my_chat_room.return_value = FakeRoomResponse(
             data=FakeRoom(id="room-456")
+        )
+        # Owner resolution is required: send_task aborts without a profile id.
+        human_client.human_api_profile.get_my_profile.return_value = FakeIdentityResponse(
+            data=FakeIdentity(id="owner-1", name="Initiator")
         )
         human_client.human_api_participants.add_my_chat_participant = AsyncMock()
         human_client.human_api_messages.send_my_chat_message = AsyncMock()

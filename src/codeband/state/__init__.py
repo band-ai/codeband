@@ -13,6 +13,10 @@ exists.
 
 from __future__ import annotations
 
+from codeband.state.registration import (
+    RegistrationResult,
+    register_task,
+)
 from codeband.state.store import (
     StateStore,
     SubtaskRow,
@@ -20,7 +24,9 @@ from codeband.state.store import (
 )
 
 __all__ = [
+    "RegistrationResult",
     "StateStore",
     "SubtaskRow",
     "TaskRow",
+    "register_task",
 ]

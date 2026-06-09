@@ -61,36 +61,51 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     room_id = room.data.id
     logger.info("Created task room: %s", room_id)
 
-    # Shadow mode (RFC WS1 / Phase 1): record the task in the durable state
-    # store. ``task_id == room_id`` — that is the only identifier available at
-    # kickoff. Record-only and fully guarded: a store write must never affect
-    # task kickoff, so any failure is swallowed with a warning.
+    # The initiator is whoever holds BAND_API_KEY (the human_client above).
+    # Resolve their Band participant id so the watchdog can @mention them when
+    # a subtask of this task lands blocked. Owner resolution is REQUIRED: a
+    # failure aborts kickoff loudly *before any message is posted* — an
+    # ownerless task can never be escalated to a human, so it must not start.
     try:
-        from codeband.state import StateStore
-
-        # The initiator is whoever holds BAND_API_KEY (the human_client above).
-        # Resolve their Band participant id the same way repl.py does, so the
-        # watchdog can @mention them when a subtask of this task lands blocked.
-        # Best-effort: a profile-lookup failure leaves owner_id None.
-        owner_id = None
-        try:
-            profile = await human_client.human_api_profile.get_my_profile()
-            owner_id = getattr(profile.data, "id", None)
-        except Exception:  # noqa: BLE001 - owner resolution must never break kickoff
-            logger.debug("Could not resolve task initiator profile", exc_info=True)
-
-        workspace_path = Path(config.workspace.path)
-        if not workspace_path.is_absolute():
-            workspace_path = project_dir / workspace_path
-        store = StateStore(workspace_path / "state" / "orchestration.db")
-        store.create_task(
-            task_id=room_id,
-            description=description,
-            room_id=room_id,
-            owner_id=owner_id,
+        profile = await human_client.human_api_profile.get_my_profile()
+        owner_id = getattr(profile.data, "id", None)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not resolve the task initiator's Band profile (needed as "
+            "the task owner). Check BAND_API_KEY and Band.ai connectivity, "
+            "then retry."
+        ) from exc
+    if not owner_id or not isinstance(owner_id, str):
+        raise RuntimeError(
+            "Band profile lookup returned no participant id — cannot register "
+            "an ownerless task. Check BAND_API_KEY, then retry."
         )
-    except Exception:  # noqa: BLE001 - shadow mode must never break kickoff
-        logger.warning("StateStore task write skipped (shadow mode)", exc_info=True)
+    raw_handle = getattr(profile.data, "name", None)
+    owner_handle = raw_handle if isinstance(raw_handle, str) else None
+
+    # Register the task — tasks row + .codeband_room pointer, atomically and
+    # row-first — BEFORE the task message below. The pointer must exist before
+    # any agent is activated, so an early cb-phase call cannot race it. Any
+    # registration failure aborts kickoff loudly; nothing is swallowed.
+    from codeband.state import StateStore
+    from codeband.state.registration import register_task
+
+    workspace_path = Path(config.workspace.path)
+    if not workspace_path.is_absolute():
+        workspace_path = project_dir / workspace_path
+    store = StateStore(workspace_path / "state" / "orchestration.db")
+    registration = register_task(
+        room_id=room_id,
+        description=description,
+        owner_id=owner_id,
+        owner_handle=owner_handle,
+        project_dir=project_dir,
+        store=store,
+    )
+    if registration.superseded_task_id:
+        logger.info(
+            "Superseded previous task %s", registration.superseded_task_id,
+        )
 
     # Human adds only the Conductor — the human's first message @mentions the
     # Conductor, so the Conductor must be a participant for that message to
@@ -117,9 +132,8 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     )
     logger.info("Task sent to room %s", room_id)
 
-    # Persist room ID so approve/reject/cleanup can target this specific room
-    room_file = project_dir / ".codeband_room"
-    room_file.write_text(room_id, encoding="utf-8")
+    # No pointer write here: register_task above already persisted
+    # .codeband_room (row-first, before the task message).
 
     # Print summary
     print(f"\nTask room: {room_id}")

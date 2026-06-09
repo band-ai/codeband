@@ -504,6 +504,61 @@ def task(description: str, project_dir: str) -> None:
     _run_async(send_task(config, project, description))
 
 
+@cli.command("register-task")
+@click.option("--room", "room_id", required=True, help="Band room UUID to register as the active task")
+@click.option("--owner", "owner_id", required=True,
+              help="Band participant id of the task owner (required — no default)")
+@click.option("--owner-handle", default=None, help="Human-readable handle for the owner")
+@click.option("--description", required=True, help="Task description to store on the row")
+@click.option("--dir", "project_dir", default=".", help="Project directory")
+@_project_aware
+def register_task_cmd(
+    room_id: str,
+    owner_id: str,
+    owner_handle: str | None,
+    description: str,
+    project_dir: str,
+) -> None:
+    """Register an existing task room in the durable state store.
+
+    Writes the tasks row and the .codeband_room pointer atomically (row-first)
+    via the same primitive `cb task` uses — for peer seeders that create the
+    room themselves (e.g. /codeband) and need cb-phase to resolve it. Makes no
+    network calls and never resolves an owner for you: pass the seeding
+    participant's id explicitly.
+    """
+    project = Path(project_dir).resolve()
+    config = load_config(project)
+
+    from codeband.state import StateStore
+    from codeband.state.registration import register_task
+
+    workspace_path = Path(config.workspace.path)
+    if not workspace_path.is_absolute():
+        workspace_path = project / workspace_path
+    store = StateStore(workspace_path / "state" / "orchestration.db")
+
+    try:
+        result = register_task(
+            room_id=room_id,
+            description=description,
+            owner_id=owner_id,
+            owner_handle=owner_handle,
+            project_dir=project,
+            store=store,
+        )
+    except Exception as exc:  # noqa: BLE001 - one exit point for any failure
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if result.outcome == "superseded":
+        click.echo(f"Superseded task {result.superseded_task_id}; registered {result.room_id}")
+    elif result.outcome == "re-registered":
+        click.echo(f"Re-registered task {result.room_id} (owner updated)")
+    else:
+        click.echo(f"Registered task {result.room_id}")
+
+
 @cli.command()
 @click.option("--sort", "sort_mode", default="newest",
               type=click.Choice(["newest", "oldest", "smallest", "largest", "most-discussed"]),
