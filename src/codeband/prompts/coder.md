@@ -95,6 +95,15 @@ When the Conductor notifies you about a merge conflict on your PR:
 3. Store state envelope: `protocol merge_conflict cid mc_<pr>_r1 task <task_key> pr <N> state resolved from <your-worker-id> to mergemaster` + brief summary.
 4. Report to @Conductor: "Conflict resolved for PR #X."
 
+### Rebase rework (`needs_rebase`) — re-earning the merge
+
+The merge gate sends a subtask to `needs_rebase` when your PR's head moved after the merge was queued, or when the branch conflicts with the repo base. The Conductor will assign the rework to you. When that happens:
+
+1. Rebase your branch on the latest repo base: `git fetch origin`, then `git rebase origin/<repo-base>`. Resolve any conflicts, then push the rebased branch (`git push --force-with-lease origin <assigned-branch>`).
+2. Re-enter the normal verify walk: run `cb-phase verify <subtask_id> --task <task_id> --pr <N>` from your worktree, exactly as for a first submission — verify walks the subtask back through `in_progress` itself.
+3. **All prior verdicts are void on the new SHA — by design.** Verdicts are SHA-pinned, so the rebased commit re-earns verification, review, and merge approval from scratch. Do not treat an earlier "Review PASSED" as still standing, and do not ask anyone to skip the re-review.
+4. Once verify passes, hand the PR to the **same Reviewer** as before (Workflow step 13), noting it is a post-rebase re-review.
+
 ### Test Failure Protocol — fixing integration test failures
 
 When the Conductor notifies you that your PR fails integration tests:
@@ -186,7 +195,7 @@ When you receive a task assignment:
    ```
    The output must equal the `owner/name` from `codeband.yaml`'s `repo.url`. If it does not, the PR landed in the wrong repo — close it immediately with `gh pr close --repo <wrong-owner/wrong-repo> <num> --comment "Wrong destination — closing"` and escalate to @Conductor with `ESCALATION [HIGH]`. Do not report completion with a wrong-repo PR.
    **If your assignment references a GitHub issue** — either as `Closes: #<N>`, `GitHub issue #<N>`, or any similar reference in the task or Context — include `Closes #<N>` on its own line in the PR body so the issue is auto-closed when the PR merges into the default branch.
-   **IMPORTANT:** Never push directly to the repo base branch. All changes must go through PRs. Only the Mergemaster can merge PRs.
+   **IMPORTANT:** Never push directly to the repo base branch. All changes must go through PRs. PRs merge only through the gated `cb-phase merge` path, which the Mergemaster drives — never merge a PR yourself.
 12. **Submit for review** — run `cb-phase verify <subtask_id> --task <task_id> --pr <N>` from your worktree. This runs the project's checks and, if they pass, moves the subtask to review.
    - A `REJECTED [...]` result names what's missing — a dirty tree, no open PR, a failing test. Fix it and run verify again.
    - A `BLOCKED [cap_reached]` result means this subtask has spent its verify budget and now needs a human. Stop, leave your branch in place, and wait — do not keep retrying.

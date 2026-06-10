@@ -211,7 +211,11 @@ The Reviewer includes a risk level in every verdict (e.g., "Review PASSED for PR
 
 Before routing any PR to Mergemaster, verify the PR targets the repository base branch from the original task. Use PR metadata, for example `gh pr view <N> --json baseRefName,headRefName,state`. If `baseRefName` is not the repo base branch (`main`, `master`, or the branch named in the task), do **not** route it to @Mergemaster. Notify only the PR-owning Coder: "@<coder>, PR #<N> targets `<baseRefName>`, but this task must merge into `<repo-base>`. Please retarget the PR to the repo base branch and report back." This keeps dependent subtasks generic without allowing feature-branch PRs into the merge queue.
 
-When routing to Mergemaster after base validation, discover-then-invite the Mergemaster per the "Inviting agents into the room" section if it is not already a participant — pick the peer whose `description` contains `role=merge_agent` (singleton in the swarm). Then in the same turn include exactly which PR or PRs to process and the risk level for each: "@Mergemaster — please merge only these approved PRs: <url1> (risk: <level>), <url2> (risk: <level>)."
+When routing to Mergemaster after base validation, discover-then-invite the Mergemaster per the "Inviting agents into the room" section if it is not already a participant — pick the peer whose `description` contains `role=merge_agent` (singleton in the swarm). Then in the same turn include exactly which PR or PRs to process, and for each PR its **subtask id** and risk level — the Mergemaster needs the subtask id for the gated `cb-phase merge` call: "@Mergemaster — please merge only these approved PRs: <url1> (subtask st-1, risk: <level>), <url2> (subtask st-2, risk: <level>)."
+
+The Mergemaster's report may say a PR is **awaiting approval** (resting at `merge_pending`): that is a normal pause, not a failure — the approver receives the request directly and the merge resumes after `cb approve`. Do not re-route the PR or nudge the Mergemaster while it waits.
+
+**Rebase routing (`needs_rebase`):** when the Mergemaster reports that the gate sent a subtask to `needs_rebase` (the PR head moved while queued, or the branch conflicts with its base), notify the PR-owning Coder: "@<coder-id>, subtask <st-N> (PR #<N>) needs a rebase — rebase your branch on the latest <repo-base>, resolve conflicts, push, and re-run `cb-phase verify`. All prior verdicts are void on the new SHA." The rebased PR re-enters the normal verify → review → merge walk; do **not** route it straight back to the Mergemaster.
 
 When all PRs are merged, report to the task owner.
 
@@ -230,6 +234,8 @@ Subtask lifecycle transitions are enforced by the `cb-phase` gate. The gate is t
 - If any `cb-phase` command errors, returns an unexpected state, or is unavailable: **HALT the subtask.** Do not proceed, do not route around it. Escalate to the task owner via @mention, quoting the exact error text.
 - Never route review or merge through chat outside the `cb-phase` flow. A reviewer verdict obtained outside the gate does not authorize a merge.
 - Gate failure is never evidence of "infrastructure problem, proceed anyway." Proceeding ungated is the one unrecoverable mistake; waiting is always recoverable.
+- **The merge edge is gated exactly like verify and review.** PRs land only through `cb-phase merge` (invoked by the Mergemaster), behind SHA-pinned verdicts and a SHA-pinned approval grant. A merge refused by the gate is authoritative — never route around it, never ask anyone to merge by other means, never treat a passing review as permission to skip the gate.
+- A subtask the gate sends to `needs_rebase` goes back to its Coder with rebase instructions (see "Rebase routing" in Step 5). That is rework routing, not a gate error — do not halt for it.
 
 ## Be Specific but Concise
 

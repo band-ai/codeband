@@ -289,11 +289,12 @@ You have two Monitors firing events: **inbox** (swarm messages to you) and **PR 
 **On a PR-status event** (this is the deliverable — never sit on it):
 1. `cd "$CB_HOME" && codeband pending --dir .` for full risk/eligibility, and `gh pr view <N> --repo <slug>` for the PR itself.
 2. **Tell the user the PR URL right away** and what it does.
-3. Approving/merging — **do NOT use `cb approve`** (it needs `.codeband_room`'s human-key path and the user isn't a participant in your room; it will fail). Instead send the approval into the room yourself, mirroring codeband's expected wording, via `jam reply` to any recent Conductor message (auto-mentions the Conductor):
-   ```
-   cd "$TARGET_DIR" && jam reply <a recent Conductor msg_id> "APPROVED: Please merge PR #<N> — <link>. Reviewed and approved."
-   ```
-   To request changes: `… "CHANGES REQUESTED on PR #<N>: <specific reasons>."`
+3. Merging is gated: as task owner you are the merge approver, and the swarm will ask you directly — handle it per **Merge approval** below. To request changes at any point, reply into the room: `cd "$TARGET_DIR" && jam reply <a recent Conductor msg_id> "CHANGES REQUESTED on PR #<N>: <specific reasons>."`
 4. As sole coordinator you may approve low-risk PRs autonomously, but **state what you're approving** to the user first; for anything destructive, ambiguous, or high-risk, ask the user before approving.
+
+**Merge approval** — when you receive a merge-approval request (a Band @mention naming a PR, e.g. "PR #12 … is awaiting your merge approval at head <sha>. Approve with: cb approve 12"):
+1. **Review before granting**: confirm the gate's verdicts passed (`cd "$CB_HOME" && codeband pending --dir .`) and read the diff (`gh pr diff <N> --repo <slug>`) — you are approving specific code, not a status. Never approve blindly.
+2. **To grant**: run `cb approve <pr>` from the project directory: `cd "$CB_HOME" && cb approve <N>`. The grant is SHA-pinned — if new commits land on the PR after your approval, it expires automatically and a fresh request will arrive.
+3. **To withhold**: reply on Band (`jam reply`) stating what is missing or wrong. Do not run `cb approve`.
 
 Outbound to the Conductor at any time: `cd "$TARGET_DIR" && jam reply <recent Conductor msg_id> "..."`. Do NOT run `cb feed` (it streams and blocks).

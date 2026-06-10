@@ -314,3 +314,77 @@ def test_conductor_repo_pin_skips_non_github_url():
         ),
     )
     assert _build_repo_pin(config) is None
+
+
+# ── Stage-2 chunk 3: the gated merge edge in prompts (code↔prompt contract) ──
+
+
+def test_mergemaster_merges_only_through_the_gate():
+    """Stage-2: the Mergemaster never executes a merge itself — every merge,
+    in the main flow AND inside the bisect, is one gated ``cb-phase merge``
+    call per PR. A direct ``gh`` merge reappearing anywhere in the prompt
+    re-opens the ungated-merge hole the FSM gate exists to close.
+    """
+    mergemaster = Path("src/codeband/prompts/mergemaster.md").read_text(
+        encoding="utf-8",
+    )
+
+    assert "cb-phase merge <subtask_id> --pr <pr-number>" in mergemaster
+    # One assertion covers both flows: no direct gh merge anywhere.
+    assert "gh pr merge" not in mergemaster
+    assert "--admin" not in mergemaster
+    # The bisect's intermediate merges are gated per-subtask too.
+    assert "Every intermediate merge in the bisect is gated per-subtask" in mergemaster
+    # Outcome discipline: rest on awaiting-approval, report needs_rebase,
+    # stop dead on blocked.
+    assert "done with this PR for now" in mergemaster
+    assert "needs_rebase" in mergemaster
+    assert "rebase the branch yourself" in mergemaster
+    assert "never attempt to route around a blocked subtask" in mergemaster
+    # Merge requests carry the subtask id the gate call needs.
+    assert "ask the Conductor for it before processing that PR" in mergemaster
+
+
+def test_conductor_halt_discipline_covers_merge_gate():
+    """The merge edge is gated exactly like verify/review: a gate refusal is
+    authoritative, and ``needs_rebase`` routes back to the owning Coder."""
+    conductor = Path("src/codeband/prompts/conductor.md").read_text(
+        encoding="utf-8",
+    )
+
+    assert "The merge edge is gated exactly like verify and review." in conductor
+    assert "A merge refused by the gate is authoritative" in conductor
+    # needs_rebase is rework routing, with verdict-void instructions.
+    assert "Rebase routing (`needs_rebase`)" in conductor
+    assert "All prior verdicts are void on the new SHA" in conductor
+    # Merge requests to the Mergemaster include subtask ids for the gate call.
+    assert "subtask st-1, risk:" in conductor
+    # Awaiting-approval is a normal pause, not a failure to re-route.
+    assert "awaiting approval" in conductor
+
+
+def test_coder_rebase_rework_reenters_verify_walk():
+    """On a ``needs_rebase`` assignment the Coder rebases, pushes, and re-runs
+    ``cb-phase verify`` — and knows prior verdicts are void on the new SHA."""
+    coder = Path("src/codeband/prompts/coder.md").read_text(encoding="utf-8")
+
+    assert "Rebase rework (`needs_rebase`)" in coder
+    assert "git rebase origin/<repo-base>" in coder
+    assert "All prior verdicts are void on the new SHA — by design." in coder
+    # Post-rebase re-review goes back through the normal walk, same reviewer.
+    assert "exactly as for a first submission" in coder
+    assert "post-rebase re-review" in coder
+
+
+def test_codeband_command_doc_grants_approval_instead_of_prohibiting():
+    """As of the merge-execution leg, ``cb approve`` writes the SHA-pinned
+    approval grant and the invoking agent is the task owner/approver — the old
+    do-not-use prohibition is obsolete and must stay gone."""
+    doc = Path("docs/commands/codeband.md").read_text(encoding="utf-8")
+
+    assert "cb approve <pr>" in doc
+    assert "SHA-pinned" in doc
+    assert "Never approve blindly" in doc
+    assert "Do not run `cb approve`" in doc  # the withhold path
+    # Distinctive substring of the pre-merge-leg prohibition.
+    assert "do NOT use `cb approve`" not in doc
