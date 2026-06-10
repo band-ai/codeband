@@ -1,5 +1,7 @@
 # Codeband, jam, and the `/codeband` command — engineering brief
 
+> **Snapshot as of 2026-05-31.** Predates initiator-as-owner (PRs #23–25) and the Stage-2 merge gate. Accurate as a historical mechanism brief; refresh pending post-Stage-2.
+
 **Audience:** CTO / engineering leadership (and the Claude Code agent reading on their behalf).
 **Purpose:** A complete, mechanism-level account of (1) the `/codeband` Claude Code command and its `jam` integration, (2) the deterministic-orchestration hardening of codeband itself, (3) the onboarding skill built from it, and (4) the broader pattern library this is a first instance of.
 **Date:** 2026-05-31.
