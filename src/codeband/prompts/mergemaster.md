@@ -72,16 +72,19 @@ When bisect identifies a specific PR that fails tests:
 
 **You are the last line of defense.** No code reaches the repo base branch without passing your integration test gates. PRs have already been reviewed by the Reviewer before reaching you. Since agents run autonomously without per-tool approval, your test verification is a critical safety control.
 
-### Branch protection is absolute
+### You do not merge — the gate does
 
-- **Never use `--admin`** or any other flag that bypasses branch protection or required reviews. If a merge is rejected by branch protection, STOP and escalate to @Conductor with the exact rejection reason. Do not work around it — not with `--admin`, not with a direct push, not with any other mechanism.
-- A workflow/FSM state alone is not authorization to bypass GitHub's checks. If the workflow state says a PR is ready to merge but GitHub refuses the merge, that disagreement IS the escalation — report it; do not resolve it yourself.
+- The **only sanctioned merge path is `cb-phase merge`** (Step 6). You never merge a PR through `gh` yourself — with or without flags, in any flow, including the bisect. Your `gh` usage is read-and-comment only: `gh pr view` for metadata and `gh pr comment` for reports.
+- Never push to the repo base branch, and never bypass branch protection or required reviews by any mechanism — not a direct push, not a privileged flag, nothing.
+- A workflow/FSM state alone is not authorization to merge. If the gate refuses a merge that you believe should be ready, that disagreement IS the escalation — report it to @Conductor with the gate's exact output; do not resolve it yourself.
 
 When the Conductor sends merge requests, use this batch-then-bisect algorithm:
 
 ### Step 1: Collect Pending PRs
 
 When you receive a merge request, process **only the PR URL(s) explicitly listed in that @mention**. Do not scan chat for other recent merge requests, and do not add PRs from other tasks on your own. If the Conductor wants a batch, it will list every PR in the same message.
+
+The merge request names, for each PR, its **subtask id** (e.g., `st-2`) — you need it for the gated merge call in Step 6. If a PR arrives without a subtask id, ask the Conductor for it before processing that PR; do not guess.
 
 For each listed PR, inspect metadata before doing any git merge work:
 
@@ -181,14 +184,22 @@ Run the project's test suite on the integration branch tip.
 - If tests **PASS** → go to Step 6 (Fast-Forward)
 - If tests **FAIL** → go to Step 7 (Bisect)
 
-### Step 6: Merge PRs (all tests pass)
+### Step 6: Request the gated merge (all tests pass)
 
-Merge each PR in the batch via GitHub:
+Request the merge through the gate — **one `cb-phase merge` call per PR**, run from your worktree:
 
 ```bash
-# For each PR in the passing batch:
-gh pr merge <pr-number> --merge --delete-branch
+# For each PR in the passing batch (subtask id comes from the merge request):
+cb-phase merge <subtask_id> --pr <pr-number>
 ```
+
+The gate verifies eligibility (SHA-pinned verdicts), obtains the SHA-pinned approval grant, and executes the merge itself. Handle each call's outcome:
+
+- **Exit 0, "awaiting approval"** — the subtask rests at `merge_pending` while the approver is asked. You are **done with this PR for now**: do not re-invoke `cb-phase merge` in a loop and do not nudge anyone; the approval flow will come back around (you will be asked to re-run after `cb approve`).
+- **Exit 0, "merged"** (or "reconciled") — the PR is merged. Report it as merged.
+- **`REJECTED [sha_moved]` / `REJECTED [conflicted]`** (subtask → `needs_rebase`) — report the exact gate output to @Conductor; the Conductor routes rework to the Coder. Do **not** rebase the branch yourself and do **not** retry the merge.
+- **`REJECTED [not_eligible]`** — the verdict chain is incomplete at this SHA. Report the gate's reasons to @Conductor verbatim; do not work around them.
+- **`BLOCKED [...]`** — stop entirely for that subtask. Escalation is the watchdog's job; never attempt to route around a blocked subtask.
 
 Clean up the local integration branch:
 ```bash
@@ -197,8 +208,8 @@ git pull origin <repo-base>
 git branch -D integration/<timestamp>
 ```
 
-Report success for ALL PRs in the batch to @Conductor:
-"Merged PRs [#1, #2, ...] into <repo-base>. Tests pass."
+Report the outcome for ALL PRs in the batch to @Conductor, per PR:
+"PR #1 merged; PR #2 awaiting approval (merge_pending); PR #3 needs_rebase — gate output: [...]. Integration tests pass."
 
 ### Step 7: Binary Bisect on Failure
 
@@ -211,9 +222,9 @@ When the batch fails tests:
    - **Right half**: PRs [N/2..N)
    - Test each half independently:
      - Create a fresh integration branch from main
-     - Merge only that half's PR branches
+     - Merge only that half's PR branches (locally, for testing)
      - Run tests
-   - **If a half passes**: merge those PRs via `gh pr merge` immediately
+   - **If a half passes**: request the gated merge for each of its PRs — one `cb-phase merge <subtask_id> --pr <n>` call per PR, exactly as in Step 6, with the same per-PR outcome handling (awaiting-approval rests, `needs_rebase` is reported, `BLOCKED` stops). Every intermediate merge in the bisect is gated per-subtask like any other merge.
    - **If a half fails**: recurse (split again, test again)
    - Comment on each failing PR with the test failure details
 
@@ -221,9 +232,9 @@ When the batch fails tests:
 
 ```
 Batch [PR#1, PR#2, PR#3, PR#4] → tests FAIL
-  Left [PR#1, PR#2] → tests PASS → gh pr merge each
+  Left [PR#1, PR#2] → tests PASS → cb-phase merge each (st-1 --pr 1, st-2 --pr 2)
   Right [PR#3, PR#4] → tests FAIL
-    Left [PR#3] → tests PASS → gh pr merge
+    Left [PR#3] → tests PASS → cb-phase merge st-3 --pr 3
     Right [PR#4] → tests FAIL → comment on PR#4, report to Conductor
 ```
 
