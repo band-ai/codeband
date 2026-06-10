@@ -11,7 +11,8 @@ this module never touches.
 Per-role content:
 
 * **conductor** → a table of *all* non-terminal subtasks (id, state, worker, PR).
-* **mergemaster** → subtasks in ``merge_pending`` / ``review_passed``.
+* **mergemaster** → subtasks in ``merge_pending`` / ``review_passed`` /
+  ``needs_rebase``.
 * **reviewer** (code reviewer) → subtasks in ``review_pending``.
 * **planner** → the active task description(s).
 * **plan_reviewer** → active task description(s) + in-flight subtask count.
@@ -128,7 +129,13 @@ async def build_agent_recovery_context(
             "Resume coordination from this state rather than re-deriving from chat.",
         )
     if role == "mergemaster":
-        pending = [st for st in active if st.state in ("merge_pending", "review_passed")]
+        # ``needs_rebase`` rests with the coder, but the Mergemaster queued the
+        # merge that was sent back — it must see the state to avoid re-queueing
+        # or treating the subtask as lost.
+        pending = [
+            st for st in active
+            if st.state in ("merge_pending", "review_passed", "needs_rebase")
+        ]
         return _table_context(
             "You reconnected as Mergemaster. Subtasks awaiting integration:",
             pending,
