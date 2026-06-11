@@ -1120,3 +1120,150 @@ async def test_human_api_messages_not_filtered_client_side(tmp_path):
     human.human_api_messages.list_my_chat_messages.assert_awaited_once_with(
         chat_id=ROOM_ID, since=since,
     )
+
+
+# ── free-tier recency probe pages to the window (follow-up to S8-F1) ────────
+
+def _paged_messages_api(pages):
+    """An ``list_agent_messages`` fake serving ``pages`` with real paging metadata.
+
+    ``pages`` is oldest-first (page 1 = oldest), each page's messages
+    oldest-first — the agent API's actual ordering. Returns ``(fetch,
+    requested_pages)``; the recorded page numbers prove which pages the probe
+    walked. ``total_pages`` is a real int so the probe's isinstance guard
+    accepts it (unlike the MagicMock sentinels of the legacy mocks).
+    """
+    requested: list[int | None] = []
+
+    async def fetch(*, chat_id, status="all", page=None, page_size=None):
+        requested.append(page)
+        p = page or 1
+        resp = MagicMock()
+        resp.data = list(pages[p - 1])
+        resp.metadata = MagicMock()
+        resp.metadata.page = p
+        resp.metadata.total_pages = len(pages)
+        return resp
+
+    return fetch, requested
+
+
+def _ts_msg(mid, ts):
+    m = MagicMock()
+    m.id = mid
+    m.inserted_at = ts
+    return m
+
+
+@pytest.mark.asyncio
+async def test_long_room_recent_activity_on_last_page_is_seen(tmp_path):
+    """A 3-page room with all recent activity on the LAST page: the probe must
+    see it. Before paging, the un-paged fetch returned page 1 (oldest), the
+    window filtered it to empty, and the probe read an active room as silence.
+    """
+    store = _seed_store(tmp_path)
+    now = datetime.now(UTC)
+    old = now - timedelta(days=10)
+    pages = [
+        [_ts_msg(f"old-1-{i}", old + timedelta(minutes=i)) for i in range(3)],
+        [_ts_msg(f"old-2-{i}", old + timedelta(hours=1, minutes=i)) for i in range(3)],
+        # Last page mixed: oldest entry outside the window, newest inside —
+        # the window boundary lies inside this page, so the walk stops here.
+        [
+            _ts_msg("stale-3-0", now - timedelta(hours=3)),
+            _ts_msg("recent-3-1", now - timedelta(minutes=10)),
+            _ts_msg("recent-3-2", now - timedelta(minutes=5)),
+        ],
+    ]
+    fetch, requested = _paged_messages_api(pages)
+    rest = _mock_rest()
+    rest.agent_api_messages.list_agent_messages = fetch
+    daemon = _daemon(store, config=WatchdogConfig(), rest=rest)
+
+    since = now - timedelta(minutes=60)
+    messages = await daemon._list_messages(ROOM_ID, since)
+
+    assert [m.id for m in messages] == ["recent-3-1", "recent-3-2"]
+    # One probe request (learns total_pages), then the LAST page; the window
+    # boundary is inside it, so no further walk.
+    assert requested == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_walk_continues_while_window_extends_into_earlier_pages(tmp_path):
+    """A fully-in-window last page means the window may extend further back:
+    the walk fetches the previous page too, and an all-recent page 1 is
+    served from the probe request without a refetch."""
+    store = _seed_store(tmp_path)
+    now = datetime.now(UTC)
+    pages = [
+        [_ts_msg("p1-0", now - timedelta(minutes=30))],
+        [_ts_msg("p2-0", now - timedelta(minutes=20))],
+        [_ts_msg("p3-0", now - timedelta(minutes=10))],
+    ]
+    fetch, requested = _paged_messages_api(pages)
+    rest = _mock_rest()
+    rest.agent_api_messages.list_agent_messages = fetch
+    daemon = _daemon(store, config=WatchdogConfig(), rest=rest)
+
+    since = now - timedelta(minutes=60)
+    messages = await daemon._list_messages(ROOM_ID, since)
+
+    # Everything is inside the window, oldest→newest order preserved.
+    assert [m.id for m in messages] == ["p1-0", "p2-0", "p3-0"]
+    # Page 1 is reused from the probe request — never fetched twice.
+    assert requested == [1, 3, 2]
+
+
+@pytest.mark.asyncio
+async def test_short_room_single_page_unchanged(tmp_path):
+    """A one-page room: one fetch, window applied, behavior as before."""
+    store = _seed_store(tmp_path)
+    now = datetime.now(UTC)
+    pages = [
+        [
+            _ts_msg("ancient", now - timedelta(days=30)),
+            _ts_msg("recent", now - timedelta(minutes=5)),
+            _ts_msg("no-ts", None),
+        ],
+    ]
+    fetch, requested = _paged_messages_api(pages)
+    rest = _mock_rest()
+    rest.agent_api_messages.list_agent_messages = fetch
+    daemon = _daemon(store, config=WatchdogConfig(), rest=rest)
+
+    since = now - timedelta(minutes=60)
+    messages = await daemon._list_messages(ROOM_ID, since)
+
+    assert [m.id for m in messages] == ["recent", "no-ts"]
+    assert requested == [1]
+
+
+@pytest.mark.asyncio
+async def test_page_walk_is_capped(tmp_path):
+    """A very long room that is fully active stops after _MAX_PROBE_PAGES
+    newest pages — beyond that the room is active by definition and older
+    history cannot change any recency verdict."""
+    from codeband.agents.watchdog import _MAX_PROBE_PAGES
+
+    store = _seed_store(tmp_path)
+    now = datetime.now(UTC)
+    # 10 pages, every message inside the window (an extremely busy room).
+    pages = [
+        [_ts_msg(f"p{p}-0", now - timedelta(minutes=59 - p))]
+        for p in range(1, 11)
+    ]
+    fetch, requested = _paged_messages_api(pages)
+    rest = _mock_rest()
+    rest.agent_api_messages.list_agent_messages = fetch
+    daemon = _daemon(store, config=WatchdogConfig(), rest=rest)
+
+    since = now - timedelta(minutes=60)
+    messages = await daemon._list_messages(ROOM_ID, since)
+
+    # Only the newest _MAX_PROBE_PAGES pages are walked (plus the probe
+    # request for page 1 that learned total_pages).
+    assert requested == [1, 10, 9, 8, 7, 6]
+    assert len(requested) - 1 == _MAX_PROBE_PAGES
+    # Newest five pages' contents, oldest→newest.
+    assert [m.id for m in messages] == ["p6-0", "p7-0", "p8-0", "p9-0", "p10-0"]
