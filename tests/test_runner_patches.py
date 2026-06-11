@@ -389,6 +389,61 @@ class TestRunAgentForever:
         )
 
 
+class TestNativeSubjectIdStripping:
+    """The old `_patch_band_subject_id_bug` workaround was removed because
+    band-sdk >=0.2.11 strips `subject_id=None` natively before the API call.
+    This pins the BEHAVIOR (not the patch) so an SDK regression resurfaces
+    here instead of as runtime 422s from the memory API."""
+
+    @pytest.mark.asyncio
+    async def test_native_store_memory_strips_subject_id_none(self):
+        from thenvoi.runtime import tools as _tools_mod
+
+        cls = getattr(_tools_mod, "AgentToolsRuntime", None) or getattr(
+            _tools_mod, "AgentTools",
+        )
+        instance = _FakeAgentToolsInstance()
+        instance.rest = MagicMock()
+        response = MagicMock()
+        response.data = {"id": "mem_1"}
+        instance.rest.agent_api_memories.create_agent_memory = AsyncMock(
+            return_value=response,
+        )
+
+        await cls.store_memory(
+            instance,
+            "protocol code_review cid cr_1_r1 state findings_posted",
+            "working", "episodic", "agent",
+            "review done",
+            scope="organization",
+            subject_id=None,
+        )
+
+        call = instance.rest.agent_api_memories.create_agent_memory.await_args
+        request = call.kwargs["memory"]
+        assert "subject_id" not in request.model_fields_set, (
+            "native band-sdk store_memory no longer strips subject_id=None — "
+            "the removed _patch_band_subject_id_bug workaround is needed again"
+        )
+
+
+class TestLocalRuntimePatchFailsLoud:
+    """An SDK whose local-runtime hooks can't even be imported must abort
+    startup — silently skipping the patch runs the fleet with PHX
+    auto-reconnect enabled, which corrupts the reconnect lifecycle."""
+
+    def test_import_error_raises_runtime_error(self, monkeypatch):
+        import sys
+
+        # `None` in sys.modules makes `from thenvoi.client.streaming import
+        # client` raise ImportError — the same failure shape as an installed
+        # band-sdk 1.0.0, which renamed the thenvoi.* namespace away.
+        monkeypatch.setitem(sys.modules, "thenvoi.client.streaming", None)
+
+        with pytest.raises(RuntimeError, match="band-sdk"):
+            _patch_band_local_runtime()
+
+
 class TestPhoenixReconnectOwnership:
     """Local mode must not let PHX run a hidden reconnect loop under Codeband."""
 
