@@ -139,6 +139,17 @@ _PATROLLED_SUBTASK_STATES: frozenset[str] = frozenset(
 )
 
 
+# Free-tier recency-probe paging. The agent message API pages OLDEST-first
+# (default page_size 20, max 100) with no ``since`` parameter, so the probe
+# requests the largest page and walks backward from the LAST page.
+_PROBE_PAGE_SIZE = 100
+# How many newest pages the probe will walk per room per patrol. A room with
+# ``_MAX_PROBE_PAGES × _PROBE_PAGE_SIZE`` (500) messages inside one staleness
+# window is active by definition — older history cannot change any recency
+# verdict, so walking further is pure cost.
+_MAX_PROBE_PAGES = 5
+
+
 @dataclasses.dataclass
 class AgentHealthState:
     """In-memory health tracking for a single agent."""
@@ -357,34 +368,91 @@ class WatchdogDaemon:
         return parts[2], _ts(latest)
 
     async def _list_messages(self, room_id: str, since: datetime) -> list[Any]:
-        """List messages in a room.
+        """List messages in a room within the ``since`` window.
 
         On enterprise tier uses the human API (captures text + thought +
-        tool_call + tool_result + error); on free tier uses the agent-API
-        inbox (text only, chat-only).
+        tool_call + tool_result + error), which bounds the read server-side
+        via its ``since`` parameter. On free tier uses the agent-API inbox
+        (text only, chat-only), which has no ``since`` parameter and pages
+        OLDEST-first — so the recency probe must page from the END:
+        requesting the default page of a long room returns only its oldest
+        messages, the client-side window filters them all out, and the probe
+        reads an active room as silence. :meth:`_fetch_recent_agent_messages`
+        fetches the newest page(s) instead; the window filter is applied here
+        on top, as before. Messages with a missing/unparseable timestamp are
+        kept — the patrol loop already skips them, and dropping them here
+        would silently change behavior for partial records.
         """
         if self._human_rest is not None:
             resp = await self._human_rest.human_api_messages.list_my_chat_messages(
                 chat_id=room_id, since=since,
             )
             return list(resp.data or [])
-        resp = await self._rest.agent_api_messages.list_agent_messages(
-            chat_id=room_id, status="all",
-        )
-        # The agent API has no ``since`` parameter (server-side paging gap —
-        # a platform ask, not something to fight client-side), so the whole
-        # room history comes back every patrol. Apply the same window bound
-        # the human-API path gets server-side here, after fetch, so the
-        # per-message mention scan never chews through months of history.
-        # Messages with a missing/unparseable timestamp are kept — the patrol
-        # loop already skips them, and dropping them here would silently
-        # change behavior for partial records.
+        raw = await self._fetch_recent_agent_messages(room_id, since)
         messages = []
-        for msg in resp.data or []:
+        for msg in raw:
             ts = _parse_ts(getattr(msg, "inserted_at", None))
             if ts is None or ts >= since:
                 messages.append(msg)
         return messages
+
+    async def _fetch_recent_agent_messages(
+        self, room_id: str, since: datetime,
+    ) -> list[Any]:
+        """Fetch the NEWEST agent-API message page(s) covering ``since``.
+
+        The agent API returns messages oldest-first with no ``since``
+        parameter (server-side recency paging is a platform ask), so one
+        probe request first learns ``metadata.total_pages``, then walks pages
+        from the LAST one backward — continuing only while every message on
+        the page is still inside the window (i.e. the window may extend into
+        the previous page) and at most :data:`_MAX_PROBE_PAGES` pages deep.
+        Beyond the cap the room has had ``_MAX_PROBE_PAGES × page_size``
+        messages inside one staleness window — active by definition; older
+        history cannot change any recency verdict.
+
+        A response without usable paging metadata (older server, test
+        doubles — the ``isinstance`` check rejects MagicMock sentinels)
+        degrades to the first response's data, the pre-paging behavior.
+        Returned oldest→newest across pages, matching single-page order.
+        """
+        fetch = self._rest.agent_api_messages.list_agent_messages
+        first = await fetch(
+            chat_id=room_id, status="all", page=1, page_size=_PROBE_PAGE_SIZE,
+        )
+        meta = getattr(first, "metadata", None)
+        total_pages = getattr(meta, "total_pages", None)
+        if not isinstance(total_pages, int) or total_pages <= 1:
+            return list(first.data or [])
+
+        pages: list[list[Any]] = []
+        page_no = total_pages
+        while page_no >= 1 and len(pages) < _MAX_PROBE_PAGES:
+            if page_no == 1:
+                data = list(first.data or [])  # already fetched above
+            else:
+                resp = await fetch(
+                    chat_id=room_id, status="all",
+                    page=page_no, page_size=_PROBE_PAGE_SIZE,
+                )
+                data = list(resp.data or [])
+            pages.append(data)
+            # Pages are oldest-first internally: the first parseable timestamp
+            # is the page's oldest. Only when even that is inside the window
+            # can the window extend into the previous page. No parseable
+            # timestamp at all → stop; nothing decidable lies further back.
+            oldest_ts = next(
+                (
+                    ts for m in data
+                    if (ts := _parse_ts(getattr(m, "inserted_at", None))) is not None
+                ),
+                None,
+            )
+            if oldest_ts is None or oldest_ts < since:
+                break
+            page_no -= 1
+        pages.reverse()
+        return [msg for page in pages for msg in page]
 
     async def _patrol(self) -> None:
         """Single patrol cycle: check all rooms for stale agents."""
