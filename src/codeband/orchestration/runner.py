@@ -85,9 +85,18 @@ def _patch_band_local_runtime() -> None:
     try:
         from thenvoi.client.streaming import client as streaming_client
         from thenvoi.runtime.presence import RoomPresence
-    except Exception:
-        logger.debug("Could not import Band local runtime hooks", exc_info=True)
-        return
+    except ImportError as exc:
+        # An SDK we cannot patch must fail loud at startup: running the fleet
+        # with PHX auto-reconnect enabled silently corrupts the reconnect
+        # lifecycle (duplicate subscriptions, recv races). The usual cause is
+        # a band-sdk version conflict — 1.0.0 renamed thenvoi.* to band.*.
+        raise RuntimeError(
+            "Cannot patch the Band SDK local runtime: importing its hooks "
+            f"failed ({exc}). This usually means an incompatible band-sdk "
+            "version is installed — Codeband requires band-sdk>=0.2.8,<0.3 "
+            "(1.0.0 renamed the thenvoi.* module namespace). "
+            "Reinstall with: pip install 'band-sdk[codex,claude-sdk]>=0.2.8,<0.3'"
+        ) from exc
 
     websocket_cls = getattr(streaming_client, "WebSocketClient", None)
     if websocket_cls is not None:
@@ -256,48 +265,6 @@ def _get_tools_class():
     )
 
 
-def _patch_band_subject_id_bug() -> None:
-    """Work around band-sdk bug: strip subject_id=None before API call."""
-    cls = _get_tools_class()
-    if cls is None or getattr(cls.store_memory, "_codeband_patched", False):
-        return
-
-    async def _patched_store_memory(
-        self,
-        content,
-        system,
-        type,
-        segment,
-        thought,
-        scope="subject",
-        subject_id=None,
-        metadata=None,
-    ):
-        from thenvoi.client.rest import MemoryCreateRequest
-
-        kwargs = dict(
-            content=content,
-            system=system,
-            type=type,
-            segment=segment,
-            thought=thought,
-            scope=scope,
-            metadata=metadata,
-        )
-        if subject_id is not None:
-            kwargs["subject_id"] = subject_id
-
-        response = await self.rest.agent_api_memories.create_agent_memory(
-            memory=MemoryCreateRequest(**kwargs)
-        )
-        if not response.data:
-            raise RuntimeError("Failed to store memory - no response data")
-        return response.data
-
-    _patched_store_memory._codeband_patched = True
-    cls.store_memory = _patched_store_memory
-
-
 def _patch_agent_tools_to_local_store(store) -> None:
     """Redirect AgentTools memory methods at `store` (a LocalMemoryStore)."""
     cls = _get_tools_class()
@@ -419,7 +386,9 @@ async def _install_memory_backend(
         print(status_line)
         print(f"Memory: local JSONL store at {store_path}")
     else:
-        _patch_band_subject_id_bug()
+        # band-sdk >=0.2.11 strips subject_id=None natively before the API
+        # call (thenvoi/runtime/tools.py), so the old _patch_band_subject_id_bug
+        # workaround is no longer needed.
         print(status_line)
         print("Memory: Band.ai remote API")
 
