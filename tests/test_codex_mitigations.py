@@ -49,6 +49,14 @@ class TestCodexTurnTimeoutKnob:
             codex_turn_timeout_seconds=60,
         ).codex_turn_timeout_seconds == 60
 
+    def test_zero_is_rejected_not_unlimited(self):
+        """band-sdk 0.2.11 has NO 0-means-unlimited special case: the event
+        loop feeds max(0.0, remaining) straight to asyncio.wait_for
+        (codex.py:683), so 0 would be an instant turn abandon. The floor
+        keeps it unrepresentable until the upstream fix lands."""
+        with pytest.raises(ValueError):
+            AgentsConfig(codex_turn_timeout_seconds=0)
+
 
 class TestMaxMessageRetriesKnob:
     def test_default_is_3(self):

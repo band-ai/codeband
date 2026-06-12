@@ -349,6 +349,17 @@ class AgentsConfig(_StrictModel):
     # ``CodexAdapterConfig(turn_timeout_s=...)`` at every Codex
     # role-constructor seam (all six runners). ge=60: anything shorter
     # cannot fit even a trivial tool-using turn.
+    #
+    # Do NOT set this to 0 expecting "unlimited": band-sdk 0.2.11 has no
+    # no-timeout special case for this knob. The event loop computes
+    # ``max(0.0, turn_timeout_s - elapsed)`` (thenvoi/adapters/codex.py:683)
+    # and feeds it straight to ``asyncio.wait_for`` via
+    # ``recv_event(timeout_s=...)`` — only ``timeout_s=None`` means "wait
+    # forever" (rpc_base.py:191-193), and the adapter never passes None — so
+    # 0 means an IMMEDIATE TimeoutError on the first event wait: instant
+    # turn abandon. 0-as-unlimited semantics arrive with the upstream
+    # band-sdk fix; until that lands the ge=60 floor deliberately makes 0
+    # unrepresentable.
     codex_turn_timeout_seconds: int = Field(default=3600, ge=60)
 
     # Per-message retry budget for the SDK session
