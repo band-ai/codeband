@@ -7,7 +7,7 @@ through a fixed lifecycle:
             → review_passed → merge_pending → merged
                             ↘ needs_rebase → in_progress (rebase rework)
                             ↘ review_failed → in_progress
-                            ↘ blocked
+                            ↘ blocked → in_progress (conductor resume)
                             ↘ abandoned
 
     (``merge_pending`` may also exit to ``needs_rebase`` — execution-time SHA
@@ -278,9 +278,14 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("review_failed", "coder"): frozenset({"in_progress", "blocked"}),
     # The Mergemaster either queues an approved subtask for integration
     # (``merge_pending`` — additionally gated at runtime by the SHA-pinned
-    # eligibility check in :func:`transition`) or sends it back because the
-    # branch is stale against the integration target (``needs_rebase``).
-    ("review_passed", "mergemaster"): frozenset({"merge_pending", "needs_rebase"}),
+    # eligibility check in :func:`transition`), sends it back because the
+    # branch/verdicts are stale against the integration target
+    # (``needs_rebase``), or — at the rebase-round cap, where another
+    # send-back is no longer legal — escalates it (``blocked``), mirroring
+    # the ``merge_pending`` row below (the cap can fire at either gate).
+    ("review_passed", "mergemaster"): frozenset(
+        {"merge_pending", "needs_rebase", "blocked"}
+    ),
     # From the merge queue the Mergemaster (via ``cb-phase merge``, the sole
     # sanctioned merge executor) either lands the PR (``merged``), discovers
     # the branch moved/conflicted at execution time and sends it back
@@ -296,6 +301,15 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # both verdicts (verify gate + re-review) at its new SHA before the
     # eligibility check can pass again.
     ("needs_rebase", "coder"): frozenset({"in_progress"}),
+    # Conductor recovery: ``cb-phase resume`` un-blocks a subtask whose block
+    # turned out to be spurious (watchdog false positive, infra hiccup) and
+    # returns it to the SAME worker mid-flight. Deliberately preserves every
+    # durable counter (``review_round`` / ``rebase_rounds`` /
+    # ``verify_attempts``) — that is the whole point versus
+    # abandon-and-redispatch; resume is NOT a cap reset, so a subtask blocked
+    # *at* a cap re-blocks on its next capped action. Conductor-only: the
+    # mirror of the ``(any, conductor) → abandoned`` wildcard.
+    ("blocked", "conductor"): frozenset({"in_progress"}),
 }
 
 

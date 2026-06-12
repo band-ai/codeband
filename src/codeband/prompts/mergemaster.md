@@ -198,8 +198,11 @@ The gate verifies eligibility (SHA-pinned verdicts), obtains the SHA-pinned appr
 - **Exit 0, "awaiting approval"** — the subtask rests at `merge_pending` while the approver is asked. You are **done with this PR for now**: do not re-invoke `cb-phase merge` in a loop and do not nudge anyone; the approval flow will come back around (you will be asked to re-run after `cb approve`).
 - **Exit 0, "merged"** (or "reconciled") — the PR is merged. Report it as merged.
 - **`REJECTED [sha_moved]` / `REJECTED [conflicted]`** (subtask → `needs_rebase`) — report the exact gate output to @Conductor; the Conductor routes rework to the Coder. Do **not** rebase the branch yourself and do **not** retry the merge.
-- **`REJECTED [not_eligible]`** — the verdict chain is incomplete at this SHA. Report the gate's reasons to @Conductor verbatim; do not work around them.
+- **`REJECTED [stale_verdicts]`** (subtask → `needs_rebase`) — the verdict chain exists but was earned at a different SHA; the gate has ALREADY routed the subtask to `needs_rebase` automatically. Handle it exactly like `sha_moved`/`conflicted`: report the gate output to @Conductor and stop.
+- **`REJECTED [not_eligible]`** — a verdict leg is missing entirely; the chain never completed and rework alone cannot cure it (the SHA-stale variant routes to `needs_rebase` automatically — see `stale_verdicts` above). Report the gate's reasons to @Conductor verbatim; do not work around them.
 - **`BLOCKED [...]`** — stop entirely for that subtask. Escalation is the watchdog's job; never attempt to route around a blocked subtask.
+
+**Never run `cb approve` yourself — under any circumstances.** `cb approve` is the HUMAN's approval primitive: it records the durable merge-approval grant that the gate exists to obtain from a person. Agents request approval exclusively through `cb-phase merge` (which sends the request and rests at `merge_pending`). Running `cb approve` from an agent session would forge the human decision — the CLI refuses inside agent sessions as an accident guard, and this prohibition stands regardless of whether the command appears to work.
 
 Clean up the local integration branch:
 ```bash

@@ -28,6 +28,15 @@ c. From ``review_passed``: attempt the gated
    ``review_passed → merge_pending`` transition at the PR head SHA. The 2a
    eligibility check runs *inside* the transition; a rejection exits non-zero
    echoing every machine-readable reason. This leg never duplicates the check.
+   **SHA-shaped ineligibility is auto-routed**: when every reason is a
+   verdict that exists but pins the wrong SHA (``stale_verdict`` — including
+   mixed-SHA legs) or pins nothing (``unpinned_verdict``), rework at the
+   current head cures it, so the subtask is driven to ``needs_rebase``
+   (``REJECTED [stale_verdicts]``, rebase-round cap applies) instead of
+   resting at ``review_passed`` behind a bare reject. A missing verdict leg
+   (``missing_verdict`` / ``unknown_*`` / ``no_head_sha``) means the chain
+   never completed — a process failure rework can't cure — and keeps the
+   bare ``REJECTED [not_eligible]``.
 d. **Execution-time SHA re-check** — BEFORE any approval logic. The PR head
    must still equal the SHA on the ``merge_pending`` transition. A push while
    waiting → ``needs_rebase``, non-zero, naming old and new SHA — before any
@@ -516,7 +525,39 @@ def _cmd_merge(args: argparse.Namespace) -> int:
                 store=store, head_sha=head_sha,
             )
         except MergeNotEligibleError as exc:
-            detail = "; ".join(exc.eligibility.reasons)
+            reasons = exc.eligibility.reasons
+            detail = "; ".join(reasons)
+            # SHA-shaped ineligibility — every reason is a verdict that EXISTS
+            # but pins the wrong SHA (``stale_verdict``, including the
+            # mixed-SHA case where legs disagree) or pins nothing
+            # (``unpinned_verdict``). Rework at the current head cures all of
+            # them, so route the subtask to ``needs_rebase`` (cap applies via
+            # _needs_rebase_or_blocked) instead of resting it at
+            # ``review_passed`` with a bare reject nobody acts on. A missing
+            # verdict leg (``missing_verdict`` / ``unknown_*`` /
+            # ``no_head_sha``) is NOT SHA-shaped — the chain never completed,
+            # which is a routing/process failure: the bare reject stands.
+            sha_shaped = bool(reasons) and all(
+                r.startswith(("stale_verdict", "unpinned_verdict"))
+                for r in reasons
+            )
+            if sha_shaped:
+                code = _needs_rebase_or_blocked(
+                    args.subtask_id, task_id,
+                    f"cb-phase merge: verdicts stale at head {head_sha} — "
+                    f"{detail}",
+                    store=store, project_dir=project_dir,
+                )
+                if code is not None:
+                    return code
+                print(
+                    f"REJECTED [stale_verdicts]: subtask {args.subtask_id} "
+                    f"cannot enter merge_pending at {head_sha!r} — {detail}. "
+                    "Subtask → needs_rebase; rework and re-earn verdicts at "
+                    "the current head.",
+                    file=sys.stderr,
+                )
+                return EXIT_NEEDS_REBASE
             print(
                 f"REJECTED [not_eligible]: subtask {args.subtask_id} cannot "
                 f"enter merge_pending at {head_sha!r} — {detail}",

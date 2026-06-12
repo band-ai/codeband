@@ -23,6 +23,23 @@ missing/``planned``/``assigned`` subtask as a backstop, so a skipped ``start``
 degrades gracefully rather than failing. Neither path touches the gates that
 matter (``verify → review_pending``, the review verdict) or the cap counters.
 
+**Conductor recovery primitives.** Two commands give the Conductor a
+code-enforced way out of a stuck subtask, both resolved through the same
+active-room contract as every other leg:
+
+    cb-phase abandon <subtask_id> [--task <label>] [--reason "..."]
+    cb-phase resume  <subtask_id> [--task <label>] [--reason "..."]
+
+``abandon`` drives the existing ``(any, conductor) → abandoned`` FSM wildcard
+(terminal — watchdog patrols stop for the row; re-dispatch means a NEW
+subtask) and prints ``ABANDONED: subtask <id> → abandoned (task <id>)``.
+``resume`` drives the ``("blocked", "conductor") → in_progress`` edge for
+spurious blocks and prints ``RESUMED: subtask <id> → in_progress …`` echoing
+the preserved counters — ``review_round`` / ``rebase_rounds`` /
+``verify_attempts`` survive a resume by design (resume is NOT a cap reset).
+The ``ABANDONED`` / ``RESUMED`` prefixes are part of the machine-greppable
+output contract, like the ``REJECTED [...]`` / ``BLOCKED [...]`` tags below.
+
 Gate sequence:
 
 0. **Verify-attempt cap.** If the subtask has already had
@@ -892,6 +909,89 @@ def _cmd_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_abandon(args: argparse.Namespace) -> int:
+    """Abandon a subtask — the Conductor's terminal recovery primitive.
+
+    Drives the existing ``(any, conductor) → abandoned`` FSM wildcard: legal
+    from every non-terminal state, never from ``merged``/``abandoned``.
+    Terminal by design — the watchdog's patrols (blocked-owner escalation,
+    stall detection) stop for the row because every patrol reads live state
+    and skips terminal rows; re-dispatching the work means a NEW subtask.
+
+    Structured output: ``ABANDONED: subtask <id> → abandoned (task <id>)`` on
+    success; a rejected transition (already terminal) prints the standard
+    ``cb-phase: transition rejected — …`` line and exits 1.
+    """
+    project_dir = resolve_project_dir(args.project_dir)
+    store = _resolve_store(project_dir)
+
+    task_id, error_code = _resolve_task_id(project_dir, store, args.task)
+    if error_code is not None:
+        return error_code
+
+    try:
+        transition(
+            args.subtask_id, task_id, "abandoned",
+            caller_role="conductor",
+            reason=args.reason or "cb-phase abandon (conductor recovery)",
+            store=store,
+        )
+    except InvalidTransitionError as exc:
+        print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"ABANDONED: subtask {args.subtask_id} → abandoned (task {task_id}). "
+        "Terminal — watchdog patrols stop for this row; re-dispatch as a new "
+        "subtask if the work is still needed."
+    )
+    return 0
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    """Resume a ``blocked`` subtask — the Conductor's non-terminal recovery.
+
+    Drives the ``("blocked", "conductor") → in_progress`` edge: the block was
+    spurious (watchdog false positive, infra hiccup) and the same worker
+    continues mid-flight. Every durable counter — ``review_round``,
+    ``rebase_rounds``, ``verify_attempts`` — is PRESERVED across the resume;
+    that is the whole point versus abandon-and-redispatch. Resume is NOT a
+    cap reset: a subtask that was blocked *at* a cap will re-block on its
+    next capped action — that case wants abandon or human intervention.
+
+    Structured output: ``RESUMED: subtask <id> → in_progress …`` echoing the
+    preserved counters; only legal from ``blocked`` — any other state prints
+    the standard rejection and exits 1.
+    """
+    project_dir = resolve_project_dir(args.project_dir)
+    store = _resolve_store(project_dir)
+
+    task_id, error_code = _resolve_task_id(project_dir, store, args.task)
+    if error_code is not None:
+        return error_code
+
+    try:
+        transition(
+            args.subtask_id, task_id, "in_progress",
+            caller_role="conductor",
+            reason=args.reason or "cb-phase resume: blocked → in_progress "
+            "(conductor recovery; counters preserved)",
+            store=store,
+        )
+    except InvalidTransitionError as exc:
+        print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+        return 1
+
+    sub = store.get_subtask(args.subtask_id, task_id)
+    print(
+        f"RESUMED: subtask {args.subtask_id} → in_progress (task {task_id}). "
+        f"Counters preserved — review_round={sub.review_round}, "
+        f"rebase_rounds={sub.rebase_rounds}, "
+        f"verify_attempts={sub.verify_attempts}."
+    )
+    return 0
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     """Record a reviewer's verdict on a ``review_pending`` subtask via the FSM.
 
@@ -1047,6 +1147,56 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project directory containing codeband.yaml (default: cwd).",
     )
     review.set_defaults(func=_cmd_review)
+
+    abandon = sub.add_parser(
+        "abandon",
+        help="Conductor recovery: abandon a subtask (terminal; any "
+        "non-terminal state).",
+    )
+    abandon.add_argument("subtask_id", help="Subtask identifier.")
+    abandon.add_argument(
+        "--task",
+        required=False,
+        help="Task label (non-authoritative; active room resolved from "
+        ".codeband_room).",
+    )
+    abandon.add_argument(
+        "--reason",
+        required=False,
+        default=None,
+        help="Why the subtask is abandoned — recorded on the transition log.",
+    )
+    abandon.add_argument(
+        "--project-dir",
+        default=".",
+        help="Project directory containing codeband.yaml (default: cwd).",
+    )
+    abandon.set_defaults(func=_cmd_abandon)
+
+    resume = sub.add_parser(
+        "resume",
+        help="Conductor recovery: resume a blocked subtask "
+        "(blocked → in_progress; counters preserved).",
+    )
+    resume.add_argument("subtask_id", help="Subtask identifier.")
+    resume.add_argument(
+        "--task",
+        required=False,
+        help="Task label (non-authoritative; active room resolved from "
+        ".codeband_room).",
+    )
+    resume.add_argument(
+        "--reason",
+        required=False,
+        default=None,
+        help="Why the block was spurious — recorded on the transition log.",
+    )
+    resume.add_argument(
+        "--project-dir",
+        default=".",
+        help="Project directory containing codeband.yaml (default: cwd).",
+    )
+    resume.set_defaults(func=_cmd_resume)
 
     # The merge leg lives in its own module (``cli/merge.py``): it talks to
     # Band for the approval request, which this module deliberately never

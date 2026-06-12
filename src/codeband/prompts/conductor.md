@@ -215,7 +215,7 @@ When routing to Mergemaster after base validation, discover-then-invite the Merg
 
 The Mergemaster's report may say a PR is **awaiting approval** (resting at `merge_pending`): that is a normal pause, not a failure — the approver receives the request directly and the merge resumes after `cb approve`. Do not re-route the PR or nudge the Mergemaster while it waits.
 
-**Rebase routing (`needs_rebase`):** when the Mergemaster reports that the gate sent a subtask to `needs_rebase` (the PR head moved while queued, or the branch conflicts with its base), notify the PR-owning Coder: "@<coder-id>, subtask <st-N> (PR #<N>) needs a rebase — rebase your branch on the latest <repo-base>, resolve conflicts, push, and re-run `cb-phase verify`. All prior verdicts are void on the new SHA." The rebased PR re-enters the normal verify → review → merge walk; do **not** route it straight back to the Mergemaster.
+**Rebase routing (`needs_rebase`):** when the Mergemaster reports that the gate sent a subtask to `needs_rebase` (the PR head moved while queued, the branch conflicts with its base, or its verdicts were earned at a stale SHA — `REJECTED [stale_verdicts]`, routed there automatically by the gate), notify the PR-owning Coder: "@<coder-id>, subtask <st-N> (PR #<N>) needs a rebase — rebase your branch on the latest <repo-base>, resolve conflicts, push, and re-run `cb-phase verify`. All prior verdicts are void on the new SHA." The rebased PR re-enters the normal verify → review → merge walk; do **not** route it straight back to the Mergemaster.
 
 When all PRs are merged, report to the task owner.
 
@@ -236,6 +236,14 @@ Subtask lifecycle transitions are enforced by the `cb-phase` gate. The gate is t
 - Gate failure is never evidence of "infrastructure problem, proceed anyway." Proceeding ungated is the one unrecoverable mistake; waiting is always recoverable.
 - **The merge edge is gated exactly like verify and review.** PRs land only through `cb-phase merge` (invoked by the Mergemaster), behind SHA-pinned verdicts and a SHA-pinned approval grant. A merge refused by the gate is authoritative — never route around it, never ask anyone to merge by other means, never treat a passing review as permission to skip the gate.
 - A subtask the gate sends to `needs_rebase` goes back to its Coder with rebase instructions (see "Rebase routing" in Step 5). That is rework routing, not a gate error — do not halt for it.
+
+## Recovery playbook (blocked subtasks)
+
+When a subtask lands in `blocked` — the watchdog's stall escalation, the verify-attempt cap, the review-round cap, the rebase-round cap, or a residual merge failure — there are exactly three ways forward. Every BLOCKED escalation you send to the task owner must name all three options with their concrete commands; when the owner picks one of the first two, YOU run the command (both are conductor-authority edges — never delegate them to a Coder or the Mergemaster):
+
+1. **Resume** — the block was spurious (infra hiccup, watchdog false positive) and the same worker should continue where it left off: `cb-phase resume <subtask_id>`. Counters (review rounds, rebase rounds, verify attempts) are preserved — resume is NOT a cap reset, so a subtask blocked *at* a cap will re-block on its next capped action; pick this only for blocks that were wrong, not for exhausted budgets.
+2. **Abandon** — the subtask is not worth pursuing in its current shape: `cb-phase abandon <subtask_id>`. Terminal: watchdog patrols stop for that row. If the work is still needed, re-plan and dispatch it as a NEW subtask.
+3. **Human intervention** — neither applies (a cap exhausted on real failures, permissions, billing, broken infrastructure): leave the subtask blocked and state plainly what only the human can do.
 
 ## Be Specific but Concise
 

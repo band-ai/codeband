@@ -273,16 +273,88 @@ def test_stale_grant_from_earlier_round_does_not_authorize(env, capsys):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_ineligible_transition_exits_nonzero_with_reasons(env, capsys):
+def test_sha_shaped_ineligibility_routes_to_needs_rebase(env, capsys):
+    """Stale verdicts (legs exist, pinned to an older SHA) are cured by
+    rework at the current head — the gate drives review_passed →
+    needs_rebase with a reason naming the stale leg, not a bare reject."""
     _drive_to_review_passed(env.store, "st-2", verify_sha="sha-0")  # stale verify
 
-    assert handoff.main(["merge", "st-2", "--pr", "43"]) == merge.EXIT_NOT_ELIGIBLE
+    assert handoff.main(["merge", "st-2", "--pr", "43"]) == merge.EXIT_NEEDS_REBASE
     err = capsys.readouterr().err
-    assert "REJECTED [not_eligible]" in err
-    assert "stale_verdict verify" in err  # 2a's reasons echoed verbatim
-    assert env.store.get_subtask("st-2", TASK).state == "review_passed"
+    assert "REJECTED [stale_verdicts]" in err
+    assert "stale_verdict verify" in err  # the stale leg is named
+    sub = env.store.get_subtask("st-2", TASK)
+    assert sub.state == "needs_rebase"
+    assert sub.rebase_rounds == 1  # counted like every other send-back
     assert env.sends == []  # no approval request for an ineligible merge
     assert env.gh_merges == []  # and no merge attempt
+
+
+def test_mixed_sha_legs_also_route_to_needs_rebase(env, capsys):
+    """Both legs exist but pin different SHAs (neither is the head) — still
+    SHA-shaped: rework at the head cures both."""
+    _drive_to_review_passed(
+        env.store, "st-2", verify_sha="sha-0", review_sha="sha-9",
+    )
+
+    assert handoff.main(["merge", "st-2", "--pr", "43"]) == merge.EXIT_NEEDS_REBASE
+    err = capsys.readouterr().err
+    assert "REJECTED [stale_verdicts]" in err
+    assert "stale_verdict verify" in err and "stale_verdict review" in err
+    assert env.store.get_subtask("st-2", TASK).state == "needs_rebase"
+
+
+def _force_state(store, sid, state):
+    """Hand-edit a subtask row's state without transition_log rows — the
+    legacy/hand-edited shape that produces missing_verdict reasons."""
+    store.ensure_subtask(sid, TASK)
+    conn = sqlite3.connect(store.db_path)
+    try:
+        conn.execute(
+            "UPDATE subtask_states SET state = ? "
+            "WHERE task_id = ? AND subtask_id = ?",
+            (state, TASK, sid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_missing_verdict_leg_stays_a_bare_reject(env, capsys):
+    """A leg with NO passing record at all is not SHA-shaped — the chain
+    never completed; rework can't cure a routing failure. Bare reject."""
+    _force_state(env.store, "st-3", "review_passed")  # no verdict rows at all
+
+    assert handoff.main(["merge", "st-3", "--pr", "44"]) == merge.EXIT_NOT_ELIGIBLE
+    err = capsys.readouterr().err
+    assert "REJECTED [not_eligible]" in err
+    assert "missing_verdict" in err
+    sub = env.store.get_subtask("st-3", TASK)
+    assert sub.state == "review_passed"  # rests, untouched
+    assert sub.rebase_rounds == 0
+
+
+def test_mixed_missing_and_stale_stays_a_bare_reject(env, capsys):
+    """One stale leg + one missing leg → conservative: bare reject (the
+    missing leg is a process failure, not a re-pin candidate)."""
+    # A real verify record at a stale SHA…
+    for new_state, role, sha in [
+        ("assigned", "conductor", None),
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", "sha-0"),
+    ]:
+        transition(
+            "st-4", TASK, new_state, caller_role=role,
+            store=env.store, head_sha=sha,
+        )
+    # …then a hand-edited jump to review_passed with no review verdict row.
+    _force_state(env.store, "st-4", "review_passed")
+
+    assert handoff.main(["merge", "st-4", "--pr", "45"]) == merge.EXIT_NOT_ELIGIBLE
+    err = capsys.readouterr().err
+    assert "REJECTED [not_eligible]" in err
+    assert env.store.get_subtask("st-4", TASK).state == "review_passed"
 
 
 def test_sha_moved_while_queued_goes_needs_rebase(env, capsys):
