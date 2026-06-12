@@ -47,8 +47,11 @@ def test_valid_transitions_matches_rfc_table():
         # is hit (the ``in_progress`` rework is then gated at runtime).
         ("review_failed", "coder"): frozenset({"in_progress", "blocked"}),
         # Stage-2 merge edge: queue for integration (gated at runtime by the
-        # SHA-pinned eligibility check) or send back for a rebase.
-        ("review_passed", "mergemaster"): frozenset({"merge_pending", "needs_rebase"}),
+        # SHA-pinned eligibility check), send back for a rebase, or — at the
+        # rebase-round cap — escalate (blocked), mirroring merge_pending.
+        ("review_passed", "mergemaster"): frozenset(
+            {"merge_pending", "needs_rebase", "blocked"}
+        ),
         # Stage-2 merge execution (cb-phase merge): land the PR, send it back
         # on execution-time SHA drift / conflict, or record a residual merge
         # failure (blocked → owner escalation via the watchdog).
@@ -56,6 +59,9 @@ def test_valid_transitions_matches_rfc_table():
             {"merged", "needs_rebase", "blocked"}
         ),
         ("needs_rebase", "coder"): frozenset({"in_progress"}),
+        # Conductor recovery (cb-phase resume): a spurious block returns to
+        # the same worker, counters preserved — NOT a cap reset.
+        ("blocked", "conductor"): frozenset({"in_progress"}),
     }
 
 

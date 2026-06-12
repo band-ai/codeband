@@ -414,3 +414,48 @@ def test_codeband_command_doc_grants_approval_instead_of_prohibiting():
     assert "Do not run `cb approve`" in doc  # the withhold path
     # Distinctive substring of the pre-merge-leg prohibition.
     assert "do NOT use `cb approve`" not in doc
+
+
+def test_conductor_recovery_playbook_names_all_three_options_with_commands():
+    """Batch 4 (findings 23–25): every BLOCKED escalation must offer the three
+    concrete recovery options WITH their commands. Pinned because unpinned
+    prompt contracts drift (the sweep-10 lesson)."""
+    conductor = Path("src/codeband/prompts/conductor.md").read_text(encoding="utf-8")
+
+    assert "## Recovery playbook (blocked subtasks)" in conductor
+    assert "`cb-phase resume <subtask_id>`" in conductor
+    assert "`cb-phase abandon <subtask_id>`" in conductor
+    assert "Human intervention" in conductor
+    assert "resume is NOT a cap reset" in conductor
+    # Conductor-authority edges: never delegated to workers.
+    assert "never delegate them to a Coder or the Mergemaster" in conductor
+
+
+def test_not_eligible_flow_references_automatic_needs_rebase_routing():
+    """SHA-stale verdicts route to needs_rebase automatically (the
+    stale_verdicts tag); the bare not_eligible reject is the missing-leg
+    case only. Both prompts must reflect the split."""
+    mergemaster = Path("src/codeband/prompts/mergemaster.md").read_text(
+        encoding="utf-8",
+    )
+    conductor = Path("src/codeband/prompts/conductor.md").read_text(encoding="utf-8")
+
+    assert "`REJECTED [stale_verdicts]`" in mergemaster
+    assert "routed the subtask to `needs_rebase` automatically" in mergemaster
+    # The bare-reject bullet survives, scoped to the missing-leg case.
+    assert "`REJECTED [not_eligible]`" in mergemaster
+    assert "a verdict leg is missing entirely" in mergemaster
+    # Conductor's rebase routing names the stale-verdict cause too.
+    assert "stale_verdicts" in conductor
+
+
+def test_mergemaster_cb_approve_prohibition_is_restated():
+    """Finding 18: the Mergemaster must never run the human-approval
+    primitive itself — the old removal of this prohibition was wrong."""
+    mergemaster = Path("src/codeband/prompts/mergemaster.md").read_text(
+        encoding="utf-8",
+    )
+
+    assert "Never run `cb approve` yourself" in mergemaster
+    assert "HUMAN's approval primitive" in mergemaster
+    assert "exclusively through `cb-phase merge`" in mergemaster
