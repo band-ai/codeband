@@ -3,7 +3,8 @@
 The activation of the Verifier seat: the ``cb-phase verify-acceptance`` leg, the
 ``verify_acceptance`` merge verdict, the broken-chain interlock, the
 claim-vs-store audit, the role gate, and the registration coupling that makes
-acceptance on-by-default exactly when a verifier is configured.
+acceptance required exactly when a verifier is configured. The seat is INERT by
+default (count=0), so these tests configure a verifier explicitly.
 
 Deterministic throughout — real SQLite, real FSM, no network. The ``cb-phase``
 leg tests monkeypatch only the store/task/PR-head resolvers, exactly like the
@@ -28,8 +29,20 @@ from codeband.workers import WorkerPool, WorkerRole
 
 
 def _verifier_agents(**overrides) -> AgentsConfig:
-    """AgentsConfig with an executable verify leg and an active verifier."""
+    """AgentsConfig with an executable verify leg and an active verifier.
+
+    The verifier seat is INERT by default (count=0), so the acceptance gate is
+    exercised by configuring a verifier explicitly here rather than relying on
+    the default. Callers can override ``verifiers`` to drive the no-verifier
+    paths.
+    """
     overrides.setdefault("handoff_verify_command", "true")
+    overrides.setdefault(
+        "verifiers",
+        VerifiersConfig(
+            claude_sdk=PoolEntry(count=1), codex=PoolEntry(count=1)
+        ),
+    )
     return AgentsConfig(**overrides)
 
 
@@ -247,7 +260,7 @@ def test_verify_acceptance_in_role_allowlist():
     assert handoff._ROLE_ALLOWED["verify-acceptance"] == frozenset({"verifier"})
 
 
-# ─── registration coupling: on-by-default with a verifier, loud without ───────
+# ─── registration coupling: required with a verifier, loud without ────────────
 
 
 def test_explicit_acceptance_without_verifier_fails(tmp_path):
