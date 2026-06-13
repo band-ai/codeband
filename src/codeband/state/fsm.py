@@ -48,7 +48,12 @@ from contextlib import closing
 from dataclasses import dataclass
 
 from codeband.state.registration import DEFAULT_REQUIRED_VERDICTS
-from codeband.state.store import StateStore, TERMINAL_STATES, _now_iso
+from codeband.state.store import (
+    StateStore,
+    TERMINAL_STATES,
+    _now_iso,
+    write_chained_transition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -504,15 +509,21 @@ def transition(
                     "WHERE task_id = ? AND subtask_id = ?",
                     (new_state, now, task_id, subtask_id),
                 )
-            conn.execute(
-                "INSERT INTO transition_log "
-                "(subtask_id, task_id, from_state, to_state, caller_role, "
-                "timestamp, reason, head_sha) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    subtask_id, task_id, current_state, new_state,
-                    caller_role, now, reason, head_sha,
-                ),
+            # Append the hash-chained transition_log row (Stage-3). The
+            # canonical serialization + chain link live in store.py so the
+            # writer and verify_chain recompute identically; this runs inside
+            # the BEGIN EXCLUSIVE transaction, so the read-prev-head → insert →
+            # hash sequence is race-free.
+            write_chained_transition(
+                conn,
+                subtask_id=subtask_id,
+                task_id=task_id,
+                from_state=current_state,
+                to_state=new_state,
+                caller_role=caller_role,
+                timestamp=now,
+                reason=reason,
+                head_sha=head_sha,
             )
             # Task completion: merging the LAST subtask promotes the task to
             # 'completed' in the same transaction (single-writer path). The

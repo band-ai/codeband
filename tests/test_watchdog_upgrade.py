@@ -499,6 +499,118 @@ async def test_no_resolvable_owner_does_not_burn_escalate_once(tmp_path):
     assert (TASK_ID, SUBTASK_ID) not in daemon._owner_escalated
 
 
+# ── ledger integrity rung (Stage-3) ─────────────────────────────────────────
+
+def _seed_chain(tmp_path, *, owner_id="owner-1"):
+    """A real store with a few hash-chained transition_log rows + an owner."""
+    from codeband.state import StateStore
+    from codeband.state.fsm import transition
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id=owner_id)
+    transition(SUBTASK_ID, TASK_ID, "assigned", caller_role="conductor", store=store)
+    transition(SUBTASK_ID, TASK_ID, "in_progress", caller_role="coder", store=store)
+    transition(SUBTASK_ID, TASK_ID, "verify_pending", caller_role="coder", store=store)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_integrity_baseline_then_chain_break_alerts(tmp_path):
+    """A first patrol baselines the chain (no alert); a subsequent in-place edit
+    of a NEW row breaks the chain forward and escalates a ledger-integrity alert."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+
+    # Tamper with an existing row in place BEFORE the first patrol, so the
+    # first (full) walk catches it.
+    conn = sqlite3.connect(store.db_path)
+    ids = [r[0] for r in conn.execute("SELECT id FROM transition_log ORDER BY id ASC").fetchall()]
+    conn.execute("UPDATE transition_log SET to_state = 'forged' WHERE id = ?", (ids[1],))
+    conn.commit()
+    conn.close()
+
+    await daemon._check_chain_integrity(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited()
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert "LEDGER INTEGRITY" in msg.content
+    assert "chain break" in msg.content
+    assert [m.id for m in msg.mentions] == ["owner-1"]
+
+
+@pytest.mark.asyncio
+async def test_integrity_head_regression_on_truncation(tmp_path):
+    """Truncating the tail of a verified chain — which a forward walk cannot
+    see — triggers a head-regression alert."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+
+    # First patrol: clean baseline, no alert.
+    await daemon._check_chain_integrity(datetime.now(UTC))
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+    # Truncate the tail — delete the last (verified) row.
+    conn = sqlite3.connect(store.db_path)
+    last = conn.execute("SELECT MAX(id) FROM transition_log").fetchone()[0]
+    conn.execute("DELETE FROM transition_log WHERE id = ?", (last,))
+    conn.commit()
+    conn.close()
+
+    await daemon._check_chain_integrity(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited()
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert "head regression" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_integrity_alert_is_once_per_room_chain_kind(tmp_path):
+    """The same integrity break escalates a single time across repeated patrols."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+
+    conn = sqlite3.connect(store.db_path)
+    first = conn.execute("SELECT MIN(id) FROM transition_log").fetchone()[0]
+    conn.execute("UPDATE transition_log SET reason = 'x' WHERE id = ?", (first,))
+    conn.commit()
+    conn.close()
+
+    now = datetime.now(UTC)
+    await daemon._check_chain_integrity(now)
+    await daemon._check_chain_integrity(now)
+    await daemon._check_chain_integrity(now)
+
+    assert rest.agent_api_messages.create_agent_chat_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_integrity_clean_chain_never_alerts(tmp_path):
+    """A clean chain produces no integrity escalation across patrols."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+
+    now = datetime.now(UTC)
+    await daemon._check_chain_integrity(now)
+    await daemon._check_chain_integrity(now)
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_integrity_rung_dormant_without_store():
+    """No store → the integrity rung is a no-op (no crash, no send)."""
+    rest = _mock_rest()
+    daemon = _daemon(None, config=WatchdogConfig(), rest=rest)
+
+    await daemon._check_chain_integrity(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
 # ── owner-awareness: nudge exclusion, marker-after-send, active-only patrol ──
 
 def _supersede(store) -> None:
