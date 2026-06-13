@@ -1591,3 +1591,72 @@ async def test_stall_blocked_alert_null_worker_null_owner_no_422(tmp_path):
 
     msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
     assert msg.mentions == []
+
+
+# ── finding 28: merge_pending SHA-drift rung routes to needs_rebase ──────────
+
+def _seed_merge_pending(tmp_path, *, approved_sha: str, owner_id: str = "owner-1"):
+    """Store with a merge_pending subtask whose approved SHA is set."""
+    import sqlite3 as _sqlite3
+    from codeband.state import StateStore
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id=owner_id)
+    store.ensure_subtask(
+        SUBTASK_ID, TASK_ID,
+        state="in_progress",
+        metadata={"branch": "feature-x"},
+    )
+    conn = _sqlite3.connect(store.db_path)
+    conn.execute(
+        "UPDATE subtask_states SET state = 'merge_pending', "
+        "merge_approved_sha = ? WHERE subtask_id = ?",
+        (approved_sha, SUBTASK_ID),
+    )
+    conn.commit()
+    conn.close()
+    return store
+
+
+@pytest.mark.asyncio
+async def test_merge_pending_sha_drift_routes_to_needs_rebase(tmp_path, monkeypatch):
+    """When the branch HEAD has moved past the approved SHA, the watchdog drives
+    the merge_pending subtask to needs_rebase via the mergemaster FSM edge."""
+    approved_sha = "aaa1111"
+    live_sha = "bbb2222"
+    store = _seed_merge_pending(tmp_path, approved_sha=approved_sha)
+    rest = _mock_rest()
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": live_sha + "\n"})(),
+    )
+
+    config = WatchdogConfig(max_phase_visits=10, git_progress_check=True)
+    daemon = _daemon(store, config=config, rest=rest)
+    now = datetime.now(UTC)
+    await daemon._check_subtask_progress(now)
+
+    sub = store.get_subtask(SUBTASK_ID, TASK_ID)
+    assert sub.state == "needs_rebase"
+
+
+@pytest.mark.asyncio
+async def test_merge_pending_sha_stable_no_reroute(tmp_path, monkeypatch):
+    """When the live HEAD matches the approved SHA no needs_rebase transition fires."""
+    sha = "aaa1111"
+    store = _seed_merge_pending(tmp_path, approved_sha=sha)
+    rest = _mock_rest()
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": sha + "\n"})(),
+    )
+
+    config = WatchdogConfig(max_phase_visits=10, git_progress_check=True)
+    daemon = _daemon(store, config=config, rest=rest)
+    now = datetime.now(UTC)
+    await daemon._check_subtask_progress(now)
+
+    sub = store.get_subtask(SUBTASK_ID, TASK_ID)
+    assert sub.state == "merge_pending"
