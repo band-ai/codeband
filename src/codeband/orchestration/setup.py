@@ -2,7 +2,7 @@
 
 Expected agents are derived from the worker-pool configuration:
 - Two singletons: `conductor`, `mergemaster`.
-- Four pools: `planners`, `plan_reviewers`, `coders`, `reviewers`.
+- Five pools: `planners`, `plan_reviewers`, `coders`, `reviewers`, `verifiers`.
   Each pool contributes `count` agents per active framework. Agent
   config keys follow `{role}-{framework}-{index}` (e.g. `coder-claude_sdk-0`);
   Band.ai display names are the friendlier `Coder-Claude-0`.
@@ -125,6 +125,17 @@ _POOL_ROLES: tuple[tuple[WorkerRole, str, str], ...] = (
             "Reports a PASS/FAIL verdict with a risk level "
             "(low/medium/high/critical) that the Conductor uses to decide "
             "auto-merge vs human approval. Discovery: role=code_review_agent"
+        ),
+    ),
+    (
+        WorkerRole.VERIFIER,
+        "verifiers",
+        (
+            "Codeband Verifier — checks evidence integrity for completed "
+            "subtasks before merge. Cross-model: verifies evidence from "
+            "Coders on the opposite framework. Posts a PASS/FAIL verdict "
+            "consumed by the merge gate. Seat is INERT (count=0) until "
+            "the verdict leg is wired. Discovery: role=verification_agent"
         ),
     ),
 )

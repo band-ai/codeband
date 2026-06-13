@@ -1405,6 +1405,7 @@ def _build_worker_roster(config: CodebandConfig) -> str:
         WorkerRole.REVIEWER: "Reviewer",
         WorkerRole.PLANNER: "Planner",
         WorkerRole.PLAN_REVIEWER: "Plan-Reviewer",
+        WorkerRole.VERIFIER: "Verifier",
     }
 
     def _display_name(role: WorkerRole, fw: Framework, index: int) -> str:
@@ -1425,6 +1426,7 @@ def _build_worker_roster(config: CodebandConfig) -> str:
     _rows(WorkerRole.REVIEWER, "Code Reviewer", config.agents.reviewers)
     _rows(WorkerRole.PLANNER, "Planner", config.agents.planners)
     _rows(WorkerRole.PLAN_REVIEWER, "Plan Reviewer", config.agents.plan_reviewers)
+    _rows(WorkerRole.VERIFIER, "Verifier", config.agents.verifiers)
     return "\n".join(lines)
 
 

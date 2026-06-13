@@ -28,6 +28,7 @@ class WorkerRole(str, Enum):
     PLAN_REVIEWER = "plan_reviewer"
     CODER = "coder"
     REVIEWER = "reviewer"
+    VERIFIER = "verifier"
 
 
 @dataclass(frozen=True)
@@ -175,6 +176,29 @@ class WorkerPool:
             reviewer_slot.busy = True
             reviewer_slot.current_task = task_id
             return coder_slot.worker_id, reviewer_slot.worker_id
+
+    def acquire_verifier_for(
+        self,
+        coder_framework: Framework,
+        *,
+        task_id: str | None = None,
+    ) -> WorkerId | None:
+        """Reserve an idle opposite-framework verifier for the given coder.
+
+        Prefers opposite-framework; falls back to same-framework when none
+        is idle (documented degradation — mirrors reviewer pairing). Returns
+        None when no verifier slot is registered (INERT default).
+        """
+        preferred_fw = opposite_framework(coder_framework)
+        with self._lock:
+            slot = self._find_idle(WorkerRole.VERIFIER, preferred_fw)
+            if slot is None:
+                slot = self._find_idle(WorkerRole.VERIFIER, coder_framework)
+            if slot is None:
+                return None
+            slot.busy = True
+            slot.current_task = task_id
+            return slot.worker_id
 
     def _find_idle(
         self, role: WorkerRole, framework: Framework,

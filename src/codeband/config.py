@@ -244,6 +244,43 @@ def _default_reviewers_pool() -> ReviewersConfig:
     )
 
 
+class VerifiersConfig(_StrictModel):
+    """Evidence integrity verifier pool.
+
+    Mirrors ReviewersConfig in shape (no review_guidelines). The seat is
+    INERT by default (count=0) — it activates when PR2 wires the verdict leg.
+    Opposite-vendor pairing (verifier.vendor != coder.vendor) is the
+    adversarial signal; single-vendor configs degrade gracefully.
+    """
+
+    claude_sdk: PoolEntry = PoolEntry()
+    codex: PoolEntry = PoolEntry()
+
+    def total_count(self) -> int:
+        return self.claude_sdk.count + self.codex.count
+
+    def active_frameworks(self) -> list[Framework]:
+        active = []
+        if self.claude_sdk.count > 0:
+            active.append(Framework.CLAUDE_SDK)
+        if self.codex.count > 0:
+            active.append(Framework.CODEX)
+        return active
+
+    def entry_for(self, framework: Framework) -> PoolEntry:
+        return self.claude_sdk if framework == Framework.CLAUDE_SDK else self.codex
+
+
+def _default_verifiers_pool() -> VerifiersConfig:
+    # count=0 keeps the seat INERT until PR2 wires the verdict leg.
+    # Models pre-set to the strongest per vendor so `count: 1` activates
+    # the seat with the best adversarial signal immediately.
+    return VerifiersConfig(
+        claude_sdk=PoolEntry(count=0, model="claude-opus-4-7"),
+        codex=PoolEntry(count=0, model="gpt-5.4"),
+    )
+
+
 class AgentsConfig(_StrictModel):
     """Configuration for all agents — worker pool + coordination singletons."""
 
@@ -256,6 +293,7 @@ class AgentsConfig(_StrictModel):
     plan_reviewers: PlanReviewersConfig = Field(default_factory=_default_plan_reviewers_pool)
     coders: FrameworkPool = Field(default_factory=_default_coders_pool)
     reviewers: ReviewersConfig = Field(default_factory=_default_reviewers_pool)
+    verifiers: VerifiersConfig = Field(default_factory=_default_verifiers_pool)
 
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
 
@@ -382,6 +420,7 @@ class AgentsConfig(_StrictModel):
             + self.plan_reviewers.total_count()
             + self.coders.total_count()
             + self.reviewers.total_count()
+            + self.verifiers.total_count()
         )
 
 
