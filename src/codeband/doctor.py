@@ -407,6 +407,41 @@ def check_cross_model_pairing(ctx: Context) -> CheckResult:
     return CheckResult(Status.OK, "Cross-model pairing possible for all pools")
 
 
+def check_verifier_pairing(ctx: Context) -> CheckResult:
+    """Warn when the verifier pool can't pair opposite-vendor to any active coder.
+
+    Fires only when at least one verifier is configured (count > 0). When the
+    verifier seat is INERT (default count=0) this check is skipped — no noise
+    for users who haven't enabled verifiers yet.
+    """
+    if ctx.config is None:
+        return CheckResult(Status.SKIP, "codeband.yaml not loaded")
+
+    agents = ctx.config.agents
+    if agents.verifiers.total_count() == 0:
+        return CheckResult(Status.SKIP, "verifier seat not active (count=0)")
+
+    coder_fws = set(agents.coders.active_frameworks())
+    verifier_fws = set(agents.verifiers.active_frameworks())
+
+    if not coder_fws:
+        return CheckResult(Status.SKIP, "no coders configured")
+
+    if len(verifier_fws) == 1 and verifier_fws <= coder_fws:
+        only = next(iter(verifier_fws))
+        return CheckResult(
+            Status.WARN,
+            f"Verifier pairing degraded: only {only.value} verifiers → "
+            "same-vendor checking (reduced adversarial value)",
+            remediation=(
+                "For adversarial evidence verification, enable opposite-framework "
+                "verifiers — e.g. add `verifiers.codex: {{count: 1}}` when all "
+                "coders are claude_sdk."
+            ),
+        )
+    return CheckResult(Status.OK, "Verifier opposite-vendor pairing possible")
+
+
 def check_agent_count_vs_tier(ctx: Context) -> CheckResult:
     """Warn when total agents > 10 (Band.ai free-tier cap)."""
     if ctx.config is None:
@@ -594,6 +629,7 @@ _CHECKS: list[Check] = [
     Check("agent_config.yaml", "Config", check_agent_config_yaml),
     Check("Workspace writable", "Config", check_workspace_writable),
     Check("Cross-model pairing", "Config", check_cross_model_pairing),
+    Check("Verifier pairing", "Config", check_verifier_pairing),
     Check("Agent count vs Band.ai tier", "Config", check_agent_count_vs_tier),
     Check("Band.ai REST reachable", "Connectivity", check_band_rest),
     Check("Memory backend", "Connectivity", check_memory_mode),
