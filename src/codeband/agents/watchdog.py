@@ -1076,7 +1076,24 @@ class WatchdogDaemon:
         if room_id is None:
             return fsm_applied
 
-        from thenvoi_rest.types import ChatMessageRequest
+        from thenvoi_rest.types import ChatMessageRequest, ChatMessageRequestMentionsItem
+
+        # Determine who to mention in the stall alert: the assigned worker
+        # when known, otherwise the task owner.  Never pass None to
+        # ChatMessageRequestMentionsItem — that produces an HTTP 422
+        # (mentioned_participant_not_in_room) from the server.
+        mention_id: str | None = getattr(sub, "assigned_worker", None)
+        if mention_id is None:
+            mention_id = await self._resolve_owner_id(sub.task_id)
+        if mention_id is None:
+            logger.debug(
+                "Stall-blocked alert for subtask %s: no mention target "
+                "(assigned_worker=None, owner unresolvable) — posting without mention",
+                sub.subtask_id,
+            )
+        mentions = (
+            [ChatMessageRequestMentionsItem(id=mention_id)] if mention_id else []
+        )
 
         suffix = "" if fsm_applied else " (blocked-transition could not be applied)"
         try:
@@ -1089,7 +1106,7 @@ class WatchdogDaemon:
                         f"patrols. Marking it blocked; Conductor please reassign or "
                         f"investigate.{suffix}"
                     ),
-                    mentions=[],
+                    mentions=mentions,
                 ),
             )
         except Exception:
