@@ -131,6 +131,17 @@ class WatchdogConfig(_StrictModel):
     # Toggle for the mechanical (git-HEAD / PR-state / transition-log) progress
     # signals. When False the watchdog falls back to chat-recency-only behavior.
     git_progress_check: bool = True
+    # Deep full-history integrity sweep cadence (Stage-3 PR3). The incremental
+    # integrity rung runs every patrol but, by construction, only re-reads rows
+    # PAST its remembered tip — it cannot see an in-place edit of an interior,
+    # already-verified row. A separate, longer-cadence rung walks BOTH hash
+    # chains from row 1 (like `cb verify-log`) every this-many patrols to close
+    # that blind spot. Code-driven: it runs regardless of whether a verifier LLM
+    # seat is allocated, because integrity is a safety sweep, not an LLM
+    # behavior. ge=1: a zero would mark the modulo undefined / never run.
+    # Default 30 patrols ≈ hourly at the default 120s patrol interval —
+    # proportionate to ledger size at this scale.
+    full_integrity_interval_patrols: int = Field(default=30, ge=1)
 
 
 # ─── Worker-pool config primitives ──────────────────────────────────────────

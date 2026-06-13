@@ -611,6 +611,213 @@ async def test_integrity_rung_dormant_without_store():
     rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
 
 
+# ── deep full-history integrity sweep (Stage-3 PR3) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_full_history_catches_interior_tamper_incremental_misses(tmp_path):
+    """The blind-spot case. After the incremental rung baselines past the tip,
+    an in-place edit of an INTERIOR old row (id below the remembered tip) is
+    invisible to the incremental walk — it only re-reads rows past the tip, and
+    the head-regression check inspects only the (unchanged) tip — yet the
+    full-history sweep, walking from row 1, catches it."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+    # interval=1 so the sweep runs on every call.
+    daemon._config = WatchdogConfig(full_integrity_interval_patrols=1)
+
+    # Baseline the incremental rung: walks the whole chain, advances the
+    # remembered tip past every current row.
+    await daemon._check_chain_integrity(datetime.now(UTC))
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+    # Tamper with an INTERIOR row (not the tip) in place.
+    conn = sqlite3.connect(store.db_path)
+    ids = [
+        r[0] for r in conn.execute(
+            "SELECT id FROM transition_log ORDER BY id ASC"
+        ).fetchall()
+    ]
+    interior_id = ids[1]  # strictly below the remembered tip (ids[-1])
+    conn.execute(
+        "UPDATE transition_log SET to_state = 'forged' WHERE id = ?",
+        (interior_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    # Incremental rung MISSES it: only walks rows past the tip; the tip row is
+    # unchanged so head-regression stays silent.
+    await daemon._check_chain_integrity(datetime.now(UTC))
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+    # Full-history sweep CATCHES it and escalates to the owner.
+    await daemon._check_chain_integrity_full(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited()
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert "LEDGER INTEGRITY" in msg.content
+    assert "chain break" in msg.content
+    assert "verifier" in msg.content.lower()  # attributed to the verifier role
+    assert [m.id for m in msg.mentions] == ["owner-1"]
+
+
+@pytest.mark.asyncio
+async def test_full_history_alert_is_once_per_room_chain_kind(tmp_path):
+    """The full-history sweep escalates a single time per (room, chain, kind)
+    across repeated patrols, reusing the rung's escalate-once pattern."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+    daemon._config = WatchdogConfig(full_integrity_interval_patrols=1)
+
+    conn = sqlite3.connect(store.db_path)
+    first = conn.execute("SELECT MIN(id) FROM transition_log").fetchone()[0]
+    conn.execute("UPDATE transition_log SET reason = 'forged' WHERE id = ?", (first,))
+    conn.commit()
+    conn.close()
+
+    now = datetime.now(UTC)
+    await daemon._check_chain_integrity_full(now)
+    await daemon._check_chain_integrity_full(now)
+    await daemon._check_chain_integrity_full(now)
+
+    assert rest.agent_api_messages.create_agent_chat_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_full_history_marker_independent_of_incremental_rung(tmp_path):
+    """The two rungs keep separate escalate-once sets: an incremental alert in a
+    room does not suppress the full-history sweep's own alert there."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+    daemon._config = WatchdogConfig(full_integrity_interval_patrols=1)
+
+    # Pre-mark the incremental rung as having already alerted this room/chain/kind.
+    daemon._integrity_alerted.add((ROOM_ID, "transition_log", "chain_break"))
+
+    conn = sqlite3.connect(store.db_path)
+    first = conn.execute("SELECT MIN(id) FROM transition_log").fetchone()[0]
+    conn.execute("UPDATE transition_log SET reason = 'forged' WHERE id = ?", (first,))
+    conn.commit()
+    conn.close()
+
+    await daemon._check_chain_integrity_full(datetime.now(UTC))
+
+    # The full rung still fires despite the incremental marker being set.
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+    assert (ROOM_ID, "transition_log", "chain_break") in daemon._full_integrity_alerted
+
+
+@pytest.mark.asyncio
+async def test_full_history_runs_only_every_n_patrols(tmp_path):
+    """With interval N, the full-history sweep verifies only on the Nth patrol;
+    earlier patrols are cheap no-ops even when a break is present."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+    daemon._config = WatchdogConfig(full_integrity_interval_patrols=3)
+
+    conn = sqlite3.connect(store.db_path)
+    first = conn.execute("SELECT MIN(id) FROM transition_log").fetchone()[0]
+    conn.execute("UPDATE transition_log SET reason = 'forged' WHERE id = ?", (first,))
+    conn.commit()
+    conn.close()
+
+    now = datetime.now(UTC)
+    # Patrols 1 and 2 are below the interval — no walk, no alert.
+    await daemon._check_chain_integrity_full(now)
+    await daemon._check_chain_integrity_full(now)
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+    # Patrol 3 hits the interval — the sweep fires.
+    await daemon._check_chain_integrity_full(now)
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_full_history_runs_independent_of_verifier_seat(tmp_path):
+    """The sweep is code-driven: it escalates even with the verifier LLM seat
+    INERT (the default), because integrity is a safety sweep, not an LLM
+    behavior. The watchdog takes no verifier-pool argument at all, so it cannot
+    structurally depend on seat allocation."""
+    from codeband.config import AgentsConfig
+
+    # Default config: the verifier seat is INERT (no allocated worker).
+    assert AgentsConfig().verifiers.total_count() == 0
+
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+    daemon._config = WatchdogConfig(full_integrity_interval_patrols=1)
+
+    conn = sqlite3.connect(store.db_path)
+    first = conn.execute("SELECT MIN(id) FROM transition_log").fetchone()[0]
+    conn.execute("UPDATE transition_log SET reason = 'forged' WHERE id = ?", (first,))
+    conn.commit()
+    conn.close()
+
+    await daemon._check_chain_integrity_full(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_full_history_finding_attributed_to_verifier_role(tmp_path):
+    """The activity-log actor for a full-history finding is the verifier role,
+    not the watchdog."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    activity = MagicMock()
+    daemon = _owner_daemon(store, rest, activity=activity)
+    daemon._config = WatchdogConfig(full_integrity_interval_patrols=1)
+
+    conn = sqlite3.connect(store.db_path)
+    first = conn.execute("SELECT MIN(id) FROM transition_log").fetchone()[0]
+    conn.execute("UPDATE transition_log SET reason = 'forged' WHERE id = ?", (first,))
+    conn.commit()
+    conn.close()
+
+    await daemon._check_chain_integrity_full(datetime.now(UTC))
+
+    actors = [
+        c.args[1] for c in activity.log.call_args_list
+        if c.args and c.args[0] == "LEDGER_INTEGRITY_ALERT"
+    ]
+    assert actors == ["verifier"]
+
+
+@pytest.mark.asyncio
+async def test_full_history_clean_chain_never_alerts(tmp_path):
+    """A clean chain produces no full-history escalation."""
+    store = _seed_chain(tmp_path)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+    daemon._config = WatchdogConfig(full_integrity_interval_patrols=1)
+
+    now = datetime.now(UTC)
+    await daemon._check_chain_integrity_full(now)
+    await daemon._check_chain_integrity_full(now)
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_full_history_rung_dormant_without_store():
+    """No store → the full-history rung is a no-op (no crash, no send)."""
+    rest = _mock_rest()
+    daemon = _daemon(
+        None,
+        config=WatchdogConfig(full_integrity_interval_patrols=1),
+        rest=rest,
+    )
+
+    await daemon._check_chain_integrity_full(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
 # ── owner-awareness: nudge exclusion, marker-after-send, active-only patrol ──
 
 def _supersede(store) -> None:
