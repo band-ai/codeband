@@ -283,13 +283,24 @@ class WatchdogDaemon:
         self._idle_skip_logged = False
         # Integrity rung (Stage-3): remembered tip of each hash chain
         # (``{chain_name: (last_verified_id, last_hash)}``). Each patrol
-        # verifies only rows past the remembered id (incremental — full-history
-        # verification is the manual ``cb verify-log``'s job) and detects head
-        # REGRESSION (the remembered tip gone/rewritten — tail truncation a
+        # verifies only rows past the remembered id (incremental) and detects
+        # head REGRESSION (the remembered tip gone/rewritten — tail truncation a
         # forward walk cannot see). Escalate-once per (room, chain, kind), same
         # marker-after-send discipline as the blocked rung.
         self._chain_tips: dict[str, tuple[int, str | None]] = {}
         self._integrity_alerted: set[tuple[str, str, str]] = set()
+        # Deep full-history integrity sweep (Stage-3 PR3): the longer-cadence
+        # counterpart to the incremental rung above. Runs every
+        # ``full_integrity_interval_patrols`` patrols, walking BOTH chains from
+        # row 1 to catch the incremental rung's structural blind spot — an
+        # in-place edit of an INTERIOR, already-verified row (id below the
+        # remembered tip), which a forward-from-tip walk never re-reads. Its own
+        # escalate-once marker set so the two rungs never suppress each other;
+        # findings are attributed to the verifier role. ``db_path`` reads only —
+        # never touches ``_chain_tips`` (that state belongs to the incremental
+        # rung; the two are fully decoupled).
+        self._full_integrity_alerted: set[tuple[str, str, str]] = set()
+        self._full_integrity_patrol_count: int = 0
 
     async def run(self) -> None:
         """Main patrol loop — runs until cancelled."""
@@ -738,6 +749,12 @@ class WatchdogDaemon:
         # hash chains and escalate a chain break or a head regression. Guarded
         # so a store/read failure never breaks the patrol loop.
         await self._check_chain_integrity(now)
+
+        # Sixth rung (Stage-3 PR3): deep full-history integrity sweep on a
+        # longer cadence. Walks both chains from row 1 every N patrols to catch
+        # the incremental rung's interior-old-row blind spot. Code-driven and
+        # independent of any verifier LLM seat; guarded like the rung above.
+        await self._check_chain_integrity_full(now)
 
     def _task_rows(self) -> list[tuple[str, str, str, str | None]] | None:
         """Return ``(task_id, room_id, status, owner_id)`` for every task row.
@@ -1445,8 +1462,30 @@ class WatchdogDaemon:
         if not problems:
             return
 
-        # An integrity break is a global event — escalate into every ACTIVE
-        # task's room to its owner, once per (room, chain, kind).
+        await self._escalate_integrity_problems(
+            problems, marker_set=self._integrity_alerted, source="watchdog",
+        )
+
+    async def _escalate_integrity_problems(
+        self,
+        problems: list[tuple[str, str, str]],
+        *,
+        marker_set: set[tuple[str, str, str]],
+        source: str,
+    ) -> None:
+        """Owner-escalate each ledger-integrity problem once per (room, chain, kind).
+
+        Shared by the incremental and full-history rungs. An integrity break is
+        a global event — it escalates into every ACTIVE task's room to its
+        owner, a single time per (room, chain, kind), with the same
+        marker-after-send discipline as the blocked rung. ``marker_set`` is the
+        calling rung's own escalate-once set (the two rungs keep SEPARATE sets so
+        a finding from one never suppresses the other); ``source`` attributes the
+        alert (``"watchdog"`` for the incremental rung, ``"verifier"`` for the
+        full-history sweep).
+        """
+        import asyncio
+
         task_rows = await asyncio.to_thread(self._task_rows)
         active = [
             (room, owner) for _, room, status, owner in (task_rows or [])
@@ -1458,16 +1497,17 @@ class WatchdogDaemon:
                 if owner_id is None or room_id is None:
                     continue
                 mkey = (room_id, chain_name, kind)
-                if mkey in self._integrity_alerted:
+                if mkey in marker_set:
                     continue
                 if await self._attempt_escalation_send(
                     self._send_integrity_alert(
                         room_id, owner_id, chain_name, kind, detail,
+                        source=source,
                     ),
                     target=f"owner {owner_id}",
                     room_id=room_id,
                 ):
-                    self._integrity_alerted.add(mkey)
+                    marker_set.add(mkey)
 
     def _verify_chains_incremental(self) -> list[tuple[str, str, str]]:
         """Incrementally verify both chains; return ``(chain, kind, detail)`` problems.
@@ -1549,15 +1589,107 @@ class WatchdogDaemon:
             conn.close()
         return problems
 
+    async def _check_chain_integrity_full(self, now: datetime) -> None:
+        """Deep full-history integrity sweep on a longer cadence (verifier role).
+
+        Co-located with the incremental rung (:meth:`_check_chain_integrity`)
+        but distinct in three ways:
+
+        * **Cadence** — runs every ``full_integrity_interval_patrols`` patrols,
+          not every patrol, because re-hashing the whole ledger is more work.
+        * **Coverage** — walks both chains from row 1, so it catches the
+          incremental rung's structural blind spot: an in-place edit of an
+          INTERIOR, already-verified row (id below the remembered tip), which a
+          forward-from-tip walk never re-reads and the head-regression check
+          (which inspects only the remembered tip) cannot see either.
+        * **Attribution** — findings are attributed to the verifier role; the
+          deep evidence-integrity sweep is conceptually the verifier's job. It
+          is code-driven and runs whether or not a verifier LLM seat is
+          allocated — integrity is a safety sweep, not an LLM behavior.
+
+        Same owner-escalation + escalate-once (per room, chain, kind) discipline
+        as the incremental rung, with its own marker set so the two rungs never
+        suppress each other. No-ops without a store; guarded so a read failure
+        never breaks the patrol loop.
+        """
+        import asyncio
+
+        if self._store is None or getattr(self._store, "db_path", None) is None:
+            return
+
+        # Longer cadence: only sweep on every Nth patrol. Counting here (rather
+        # than off the main patrol counter) keeps the rung self-contained and
+        # the cadence independent of the other rungs.
+        self._full_integrity_patrol_count += 1
+        interval = self._config.full_integrity_interval_patrols
+        if self._full_integrity_patrol_count % interval != 0:
+            return
+
+        try:
+            problems = await asyncio.to_thread(self._verify_chains_full)
+        except Exception:
+            logger.debug(
+                "Watchdog full-history integrity verify failed", exc_info=True,
+            )
+            return
+        if not problems:
+            return
+
+        await self._escalate_integrity_problems(
+            problems, marker_set=self._full_integrity_alerted, source="verifier",
+        )
+
+    def _verify_chains_full(self) -> list[tuple[str, str, str]]:
+        """Verify both hash chains from row 1 (genesis); return ``(chain, kind, detail)``.
+
+        The deep counterpart to :meth:`_verify_chains_incremental`: it re-reads
+        and re-hashes EVERY row rather than only rows past the remembered tip,
+        reusing ``cb verify-log``'s whole-chain logic (``verify_chain`` with the
+        default ``after_id=0``). This is the only rung that catches an in-place
+        edit of an interior, already-verified row. Read-only and stateless —
+        deliberately never touches ``self._chain_tips`` (that belongs to the
+        incremental rung; the two rungs stay fully decoupled).
+        """
+        from codeband.state.store import (
+            AUDIT_HASH_COLS,
+            TRANSITION_HASH_COLS,
+            verify_chain,
+        )
+
+        problems: list[tuple[str, str, str]] = []
+        conn = sqlite3.connect(self._store.db_path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            for table, cols in (
+                ("transition_log", TRANSITION_HASH_COLS),
+                ("audit_log", AUDIT_HASH_COLS),
+            ):
+                result = verify_chain(conn, table, cols)
+                if not result.ok:
+                    problems.append((
+                        table,
+                        "chain_break",
+                        f"first broken row id={result.broken_id}: expected "
+                        f"row_hash {result.expected_hash}, stored "
+                        f"{result.actual_hash}",
+                    ))
+        finally:
+            conn.close()
+        return problems
+
     async def _send_integrity_alert(
         self, room_id: str, owner_id: str, chain_name: str, kind: str,
-        detail: str,
+        detail: str, *, source: str = "watchdog",
     ) -> None:
         """@mention the owner about a ledger integrity break.
 
         Sent with the watchdog's (Conductor's) credentials, like the other
         rungs. The owner is a distinct room participant, so the mention is
-        valid. Send failures propagate to the caller, which owns the
+        valid. ``source`` names which rung found the break — ``"watchdog"`` for
+        the per-patrol incremental check, ``"verifier"`` for the deep
+        full-history sweep — and is carried into both the chat text and the
+        activity-log actor so a full-history finding is attributed to the
+        verifier role. Send failures propagate to the caller, which owns the
         escalate-once marker (marker-after-send).
         """
         from thenvoi_rest.types import (
@@ -1570,12 +1702,18 @@ class WatchdogDaemon:
             if kind == "chain_break"
             else "head regression (rows may have been truncated)"
         )
+        sweep = (
+            "verifier full-history integrity sweep"
+            if source == "verifier"
+            else "watchdog integrity check"
+        )
         handle = self._owner_handle or owner_id
         await self._rest.agent_api_messages.create_agent_chat_message(
             chat_id=room_id,
             message=ChatMessageRequest(
                 content=(
-                    f"@{handle} LEDGER INTEGRITY ALERT — {chain_name}: {label}. "
+                    f"@{handle} LEDGER INTEGRITY ALERT ({sweep}) — "
+                    f"{chain_name}: {label}. "
                     f"{detail}. Run `cb verify-log` and investigate: the state "
                     "ledger may have been modified out of band."
                 ),
@@ -1584,7 +1722,7 @@ class WatchdogDaemon:
         )
         if self._activity:
             self._activity.log(
-                "LEDGER_INTEGRITY_ALERT", "watchdog",
+                "LEDGER_INTEGRITY_ALERT", source,
                 f"{chain_name} {kind}: {detail}",
             )
 
