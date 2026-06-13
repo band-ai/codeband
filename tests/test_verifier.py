@@ -1,11 +1,17 @@
-"""Tests for the Verifier seat scaffolding (PR1 — INERT by default).
+"""Tests for the Verifier seat — config/pool/doctor wiring.
 
 Covers:
-- VerifiersConfig pool shape and INERT defaults
+- VerifiersConfig pool shape and INERT defaults (count=0)
 - WorkerRole.VERIFIER identity string
 - WorkerPool.acquire_verifier_for opposite-vendor pairing + fallback
 - cb doctor check_verifier_pairing
-- Required-verdicts snapshot unchanged (no new verdict leg in PR1)
+- verify_acceptance is a known verdict, coupled to a *configured* verifier
+
+The verdict leg is wired, but the seat stays INERT by default — on-by-default
+activation is deferred to the PR that lands the Verifier runtime + dispatch, so
+the gate tests below configure a verifier explicitly. The verdict leg itself,
+broken-chain interlock, claim-vs-store audit, merge gating, and role gate live
+in test_verifier_acceptance.py.
 """
 
 from __future__ import annotations
@@ -281,22 +287,38 @@ class TestDoctorVerifierPairing:
         assert check_verifier_pairing in fns
 
 
-# ─── INERT: required verdicts unchanged ──────────────────────────────────────
+# ─── verify_acceptance verdict coupling (leg wired, INERT default) ────────────
 
-class TestVerifierInert:
-    def test_known_verdicts_unchanged(self):
-        """KNOWN_VERDICTS must not include a new verifier verdict in PR1."""
+class TestVerifierVerdictCoupling:
+    def test_known_verdicts_includes_verify_acceptance(self):
+        """The verdict leg is wired → verify_acceptance is a known verdict."""
         from codeband.state.registration import KNOWN_VERDICTS
-        assert KNOWN_VERDICTS == frozenset({"verify", "review"})
+        assert KNOWN_VERDICTS == frozenset(
+            {"verify", "review", "verify_acceptance"}
+        )
 
-    def test_default_required_verdicts_unchanged(self):
-        """Default resolved verdicts are ['verify', 'review'] — no new verdict in PR1.
+    def test_default_required_verdicts_add_acceptance_when_verifier_configured(self):
+        """Resolved verdicts add verify_acceptance iff a verifier is configured.
 
-        resolve_required_verdicts enforces that handoff_verify_command is set
-        when 'verify' is in the list, so we supply one to isolate the verdict
-        content check from the precondition check.
+        The seat is INERT by default, so the gate is exercised by configuring a
+        verifier explicitly here. resolve_required_verdicts enforces that
+        handoff_verify_command is set when 'verify' is in the list, so we supply
+        one to isolate the verdict content check from the precondition check.
         """
         from codeband.state.registration import resolve_required_verdicts
+        agents = AgentsConfig(
+            handoff_verify_command="make test",
+            verifiers=VerifiersConfig(
+                claude_sdk=PoolEntry(count=1), codex=PoolEntry(count=1)
+            ),
+        )
+        result = resolve_required_verdicts(agents)
+        assert set(result) == {"verify", "review", "verify_acceptance"}
+
+    def test_default_required_verdicts_pair_when_verifiers_inert(self):
+        """With the default (inert) verifier seat, the default stays verify/review."""
+        from codeband.state.registration import resolve_required_verdicts
+        # Default AgentsConfig has verifiers count=0 — no acceptance coupling.
         agents = AgentsConfig(handoff_verify_command="make test")
         result = resolve_required_verdicts(agents)
         assert set(result) == {"verify", "review"}

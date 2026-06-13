@@ -258,10 +258,16 @@ def _default_reviewers_pool() -> ReviewersConfig:
 class VerifiersConfig(_StrictModel):
     """Evidence integrity verifier pool.
 
-    Mirrors ReviewersConfig in shape (no review_guidelines). The seat is
-    INERT by default (count=0) — it activates when PR2 wires the verdict leg.
-    Opposite-vendor pairing (verifier.vendor != coder.vendor) is the
-    adversarial signal; single-vendor configs degrade gracefully.
+    Mirrors ReviewersConfig in shape (no review_guidelines). The verdict leg is
+    wired (``cb-phase verify-acceptance``) — a configured verifier makes
+    ``verify_acceptance`` a required, SHA-pinned merge verdict (see
+    ``state/registration.py``) — but the seat is INERT by default (count=0):
+    on-by-default activation is deferred to a later PR that also lands the
+    Verifier runtime + dispatch, so merging the gate cannot strand tasks at
+    ``review_passed`` with no agent to produce the verdict. Opposite-vendor
+    pairing (verifier.vendor != coder.vendor) is the adversarial signal;
+    single-vendor configs degrade gracefully (same-vendor checking; cb doctor
+    warns, never fails).
     """
 
     claude_sdk: PoolEntry = PoolEntry()
@@ -283,9 +289,13 @@ class VerifiersConfig(_StrictModel):
 
 
 def _default_verifiers_pool() -> VerifiersConfig:
-    # count=0 keeps the seat INERT until PR2 wires the verdict leg.
-    # Models pre-set to the strongest per vendor so `count: 1` activates
-    # the seat with the best adversarial signal immediately.
+    # count=0 keeps the seat INERT by default: the verdict leg is wired, but
+    # nothing produces the verdict yet, so on-by-default activation waits for
+    # the PR that lands the Verifier runtime + dispatch. Until then a default
+    # config merges straight from ``review_passed`` (no acceptance required),
+    # keeping the default at 8 Band seats. Models are pre-set to the strongest
+    # per vendor so a single ``count: 1`` activates the seat with the best
+    # adversarial signal (opposite-vendor for the default coder mix).
     return VerifiersConfig(
         claude_sdk=PoolEntry(count=0, model="claude-opus-4-7"),
         codex=PoolEntry(count=0, model="gpt-5.4"),
@@ -318,10 +328,15 @@ class AgentsConfig(_StrictModel):
     # ``state/registration.py`` — the single writer of "a task exists" — and
     # snapshotted onto the tasks row, so a mid-task config edit cannot change
     # what an in-flight task requires. ``None`` (key absent) resolves to the
-    # default ``["verify", "review"]``; an explicit ``[]`` is a loud error
-    # unless ``allow_ungated_merge`` is also set. Known verdicts: ``verify``
-    # (requires ``handoff_verify_command``) and ``review``. Nothing consumes
-    # the snapshot yet — the merge leg lands in the next chunk.
+    # default ``["verify", "review"]`` — plus ``"verify_acceptance"`` whenever a
+    # verifier is configured (the iff-configured coupling in
+    # ``state/registration.py``; verifiers are count=0 by default, so the
+    # default snapshot stays the verify/review pair); an explicit ``[]`` is a
+    # loud error unless
+    # ``allow_ungated_merge`` is also set. Known verdicts: ``verify`` (requires
+    # ``handoff_verify_command``), ``review``, and ``verify_acceptance``
+    # (requires a configured verifier). The merge-eligibility gate
+    # (``state/fsm.py``) reads the snapshot.
     required_verdicts: list[str] | None = None
 
     # Escape hatch for ``required_verdicts: []`` — the name is deliberately
