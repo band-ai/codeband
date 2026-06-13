@@ -19,15 +19,25 @@ from codeband.state.registration import (
     register_task,
 )
 from codeband.state.store import (
+    AUDIT_HASH_COLS,
+    ChainVerifyResult,
+    GENESIS_PREV_HASH,
     StateStore,
     SubtaskRow,
+    TRANSITION_HASH_COLS,
     TaskRow,
+    verify_chain,
 )
 
 __all__ = [
+    "AUDIT_HASH_COLS",
+    "ChainVerifyResult",
+    "GENESIS_PREV_HASH",
     "RegistrationResult",
     "StateStore",
     "SubtaskRow",
+    "TRANSITION_HASH_COLS",
     "TaskRow",
     "register_task",
+    "verify_chain",
 ]

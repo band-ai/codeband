@@ -1387,6 +1387,73 @@ def log(agent: str | None, event_type: str | None, since: str | None,
         click.echo(f"{date} {ts}  {event.event_type:<18s} {agent_name:<16s} {summary}")
 
 
+@cli.command("verify-log")
+@click.option("--dir", "project_dir", default=".", help="Project directory")
+@_project_aware
+def verify_log(project_dir: str) -> None:
+    """Verify the integrity of the hash-chained audit ledgers.
+
+    Walks BOTH global hash chains in the state DB — ``transition_log`` (FSM
+    transitions) and ``audit_log`` (approval grants / markers / pr_number
+    bindings / ungated merges) — recomputing every row's hash from its stored
+    business columns and comparing against the stored ``row_hash``.
+
+    On success: prints per-chain row counts and head hashes, exits 0. On a
+    break: names the first broken row id, the expected vs the stored hash, and
+    exits non-zero. This is tamper-EVIDENT, not tamper-proof — a process with
+    write access to the DB can recompute a whole chain; what it cannot do is
+    edit a single row and leave the chain consistent. Detection over
+    prevention, by design.
+    """
+    import sqlite3
+
+    from codeband.cli.handoff import resolve_project_dir
+    from codeband.config import resolve_workspace_path
+    from codeband.state import (
+        AUDIT_HASH_COLS,
+        TRANSITION_HASH_COLS,
+        verify_chain,
+    )
+
+    project = resolve_project_dir(project_dir)
+    config = load_config(project)
+    workspace_path = resolve_workspace_path(config, project)
+    db_path = workspace_path / "state" / "orchestration.db"
+
+    if not db_path.exists():
+        click.echo(f"No state DB at {db_path} — nothing to verify.")
+        return
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    chains = (
+        ("transition_log", TRANSITION_HASH_COLS),
+        ("audit_log", AUDIT_HASH_COLS),
+    )
+    broken = False
+    try:
+        for table, cols in chains:
+            result = verify_chain(conn, table, cols)
+            if result.ok:
+                head = result.head_hash[:12] if result.head_hash else "—(empty)"
+                click.echo(
+                    f"OK   {table:<16s} {result.row_count} rows, head {head}"
+                )
+            else:
+                broken = True
+                click.echo(
+                    f"BREAK {table:<15s} first broken row id={result.broken_id}: "
+                    f"expected row_hash {result.expected_hash}, "
+                    f"stored {result.actual_hash}",
+                    err=True,
+                )
+    finally:
+        conn.close()
+
+    if broken:
+        raise SystemExit(1)
+
+
 def _parse_since(value: str):
     """Parse a --since value like '1h', '30m', or ISO date."""
     from datetime import UTC, datetime as dt, timedelta

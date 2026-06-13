@@ -281,6 +281,15 @@ class WatchdogDaemon:
         # Track whether we logged an "idle — skipping patrols" line this
         # idle window so we don't repeat it every cycle.
         self._idle_skip_logged = False
+        # Integrity rung (Stage-3): remembered tip of each hash chain
+        # (``{chain_name: (last_verified_id, last_hash)}``). Each patrol
+        # verifies only rows past the remembered id (incremental — full-history
+        # verification is the manual ``cb verify-log``'s job) and detects head
+        # REGRESSION (the remembered tip gone/rewritten — tail truncation a
+        # forward walk cannot see). Escalate-once per (room, chain, kind), same
+        # marker-after-send discipline as the blocked rung.
+        self._chain_tips: dict[str, tuple[int, str | None]] = {}
+        self._integrity_alerted: set[tuple[str, str, str]] = set()
 
     async def run(self) -> None:
         """Main patrol loop — runs until cancelled."""
@@ -724,6 +733,11 @@ class WatchdogDaemon:
         # owner_id is supplied (post-activation); guarded so a notify failure
         # never breaks the patrol loop.
         await self._check_blocked_subtasks(now)
+
+        # Fifth rung (Stage-3): ledger integrity. Incrementally verify the
+        # hash chains and escalate a chain break or a head regression. Guarded
+        # so a store/read failure never breaks the patrol loop.
+        await self._check_chain_integrity(now)
 
     def _task_rows(self) -> list[tuple[str, str, str, str | None]] | None:
         """Return ``(task_id, room_id, status, owner_id)`` for every task row.
@@ -1280,6 +1294,182 @@ class WatchdogDaemon:
         if not row or not row[0]:
             return None
         return row[0]
+
+    # ── ledger integrity rung (Stage-3) ────────────────────────────────────
+
+    async def _check_chain_integrity(self, now: datetime) -> None:
+        """Verify the hash chains incrementally and escalate any tamper signal.
+
+        Two alert conditions, both rung-style owner escalations with the
+        marker discipline of the other rungs:
+
+        * **chain break** — a row whose recomputed hash disagrees with its
+          stored ``row_hash`` (an in-place edit of a business column);
+        * **head regression** — the previously-verified tip is gone or
+          rewritten (tail truncation), which a forward chain walk by
+          construction cannot see, so it is checked explicitly against the
+          remembered ``(id, hash)``.
+
+        Incremental by design: each patrol verifies only rows past the
+        remembered tip (``self._chain_tips``). Full-history verification stays
+        the manual ``cb verify-log``'s job. No-ops without a store; guarded so
+        a read failure never breaks the patrol loop.
+        """
+        import asyncio
+
+        if self._store is None or getattr(self._store, "db_path", None) is None:
+            return
+
+        try:
+            problems = await asyncio.to_thread(self._verify_chains_incremental)
+        except Exception:
+            logger.debug("Watchdog chain-integrity verify failed", exc_info=True)
+            return
+        if not problems:
+            return
+
+        # An integrity break is a global event — escalate into every ACTIVE
+        # task's room to its owner, once per (room, chain, kind).
+        task_rows = await asyncio.to_thread(self._task_rows)
+        active = [
+            (room, owner) for _, room, status, owner in (task_rows or [])
+            if status == "active"
+        ]
+        for chain_name, kind, detail in problems:
+            for room_id, owner in active:
+                owner_id = owner or self._owner_id
+                if owner_id is None or room_id is None:
+                    continue
+                mkey = (room_id, chain_name, kind)
+                if mkey in self._integrity_alerted:
+                    continue
+                if await self._attempt_escalation_send(
+                    self._send_integrity_alert(
+                        room_id, owner_id, chain_name, kind, detail,
+                    ),
+                    target=f"owner {owner_id}",
+                    room_id=room_id,
+                ):
+                    self._integrity_alerted.add(mkey)
+
+    def _verify_chains_incremental(self) -> list[tuple[str, str, str]]:
+        """Incrementally verify both chains; return ``(chain, kind, detail)`` problems.
+
+        Reads the store's SQLite file directly (read-only), like the watchdog's
+        other DB readers. Advances ``self._chain_tips`` past every verified row
+        so the next patrol only re-checks new rows. On a head regression the
+        tip is re-baselined to the current physical tip so forward verification
+        resumes (the alert has already fired; the escalate-once marker stops a
+        repeat).
+        """
+        from codeband.state.store import (
+            AUDIT_HASH_COLS,
+            TRANSITION_HASH_COLS,
+            verify_chain,
+        )
+
+        problems: list[tuple[str, str, str]] = []
+        conn = sqlite3.connect(self._store.db_path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            for table, cols in (
+                ("transition_log", TRANSITION_HASH_COLS),
+                ("audit_log", AUDIT_HASH_COLS),
+            ):
+                last_id, last_hash = self._chain_tips.get(table, (0, None))
+
+                # Head regression: the remembered tip row is gone or its hash
+                # was rewritten, or the physical max id fell below it
+                # (truncation). A pure forward walk from last_id cannot see
+                # this, so check it before walking.
+                if last_id > 0:
+                    tip = conn.execute(
+                        f"SELECT row_hash FROM {table} WHERE id = ?",  # noqa: S608 — fixed literal
+                        (last_id,),
+                    ).fetchone()
+                    max_row = conn.execute(
+                        f"SELECT MAX(id) AS m FROM {table}"  # noqa: S608 — fixed literal
+                    ).fetchone()
+                    cur_max = max_row["m"] if max_row is not None else None
+                    if (
+                        tip is None
+                        or tip["row_hash"] != last_hash
+                        or (cur_max is not None and cur_max < last_id)
+                    ):
+                        problems.append((
+                            table,
+                            "head_regression",
+                            f"remembered head id={last_id} is gone or rewritten "
+                            f"(current max id={cur_max}) — possible tail truncation",
+                        ))
+                        # Re-baseline to the current physical tip so forward
+                        # verification resumes next cycle.
+                        cur = conn.execute(
+                            f"SELECT id, row_hash FROM {table} "  # noqa: S608 — fixed literal
+                            "ORDER BY id DESC LIMIT 1"
+                        ).fetchone()
+                        self._chain_tips[table] = (
+                            (cur["id"], cur["row_hash"]) if cur is not None
+                            else (0, None)
+                        )
+                        continue
+
+                result = verify_chain(
+                    conn, table, cols, after_id=last_id, prev_hash=last_hash,
+                )
+                if not result.ok:
+                    problems.append((
+                        table,
+                        "chain_break",
+                        f"first broken row id={result.broken_id}: expected "
+                        f"row_hash {result.expected_hash}, stored "
+                        f"{result.actual_hash}",
+                    ))
+                # Advance the tip to the last good row (the break stops the
+                # walk, so head_id/head_hash is the last verified row before it).
+                self._chain_tips[table] = (result.head_id, result.head_hash)
+        finally:
+            conn.close()
+        return problems
+
+    async def _send_integrity_alert(
+        self, room_id: str, owner_id: str, chain_name: str, kind: str,
+        detail: str,
+    ) -> None:
+        """@mention the owner about a ledger integrity break.
+
+        Sent with the watchdog's (Conductor's) credentials, like the other
+        rungs. The owner is a distinct room participant, so the mention is
+        valid. Send failures propagate to the caller, which owns the
+        escalate-once marker (marker-after-send).
+        """
+        from thenvoi_rest.types import (
+            ChatMessageRequest,
+            ChatMessageRequestMentionsItem,
+        )
+
+        label = (
+            "chain break (a row was edited in place)"
+            if kind == "chain_break"
+            else "head regression (rows may have been truncated)"
+        )
+        handle = self._owner_handle or owner_id
+        await self._rest.agent_api_messages.create_agent_chat_message(
+            chat_id=room_id,
+            message=ChatMessageRequest(
+                content=(
+                    f"@{handle} LEDGER INTEGRITY ALERT — {chain_name}: {label}. "
+                    f"{detail}. Run `cb verify-log` and investigate: the state "
+                    "ledger may have been modified out of band."
+                ),
+                mentions=[ChatMessageRequestMentionsItem(id=owner_id)],
+            ),
+        )
+        if self._activity:
+            self._activity.log(
+                "LEDGER_INTEGRITY_ALERT", "watchdog",
+                f"{chain_name} {kind}: {detail}",
+            )
 
     async def _send_nudge(
         self, room_id: str, agent_id: str, names: dict[str, str],

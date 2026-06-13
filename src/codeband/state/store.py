@@ -1,7 +1,7 @@
 """SQLite-backed durable state store (RFC Workstream 1).
 
 A single local SQLite database at ``{workspace_path}/state/orchestration.db``
-holds three tables:
+holds four tables:
 
 * ``tasks`` — one row per task (keyed by ``room_id``).
 * ``subtask_states`` — one row per ``(task_id, subtask_id)``, its current FSM
@@ -9,7 +9,23 @@ holds three tables:
   planners number subtasks ``st-1``, ``st-2``, … fresh per plan, so a bare
   ``subtask_id`` is NOT unique across tasks in a reused DB.
 * ``transition_log`` — append-only audit of every state transition, keyed by
-  ``(task_id, subtask_id)`` like the rows it audits.
+  ``(task_id, subtask_id)`` like the rows it audits. Hash-chained (Stage-3):
+  every row carries ``prev_hash`` / ``row_hash`` over a canonical serialization
+  of its business columns, so an after-the-fact edit of any row breaks the
+  chain at exactly that point (``cb verify-log`` / the watchdog's integrity
+  rung detect it).
+* ``audit_log`` — append-only, separately hash-chained record of effects that
+  are NOT FSM transitions (approval grants, approval-request markers,
+  ``pr_number`` bindings, the ``ungated_external_merge`` event). Kept distinct
+  from ``transition_log`` so the watchdog's transition patrols keep their
+  "FSM transitions only" semantics; grant history is append-only here even
+  though the live grant columns on ``subtask_states`` stay current-state.
+
+**Tamper-evidence, not tamper-proofing.** The hash chains make accidental
+corruption and after-the-fact edits *detectable* (detection over prevention).
+They are NOT a defense against a motivated process with write access to the
+DB file — such a process can recompute the whole chain. That is the adversary
+line we deliberately do not defend; see the Stage-3 design posture.
 
 Design notes:
 
@@ -33,8 +49,10 @@ transitions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -54,6 +72,199 @@ TERMINAL_STATES: frozenset[str] = frozenset({"merged", "abandoned"})
 def _now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── hash-chaining (Stage-3 evidence integrity) ─────────────────────────────
+#
+# Each append-only chain (``transition_log``, ``audit_log``) is a single global
+# chain ordered by ``id``. Every row's ``row_hash`` is the SHA-256 of a CANONICAL
+# serialization (``json.dumps(..., sort_keys=True)`` → UTF-8) of the row's
+# business columns PLUS the previous row's ``row_hash``. The first row's
+# ``prev_hash`` is the genesis constant. Recomputing the chain over the stored
+# columns and comparing ``row_hash`` makes any after-the-fact edit of a business
+# column break the chain at exactly that row. This is tamper-EVIDENT, not
+# tamper-proof: a process that can write the DB can recompute the chain.
+
+# Genesis ``prev_hash`` of the first row in any chain. Versioned so a future
+# canonicalization change can rev the constant without colliding with old chains.
+GENESIS_PREV_HASH = hashlib.sha256(b"codeband-genesis-v1").hexdigest()
+
+# Business columns hashed for ``transition_log`` rows, in no particular order
+# (``sort_keys=True`` canonicalizes). ``head_sha`` IS part of the chained set:
+# the merge-eligibility gate pins on it, so an in-place edit of ``head_sha``
+# alone must be tamper-evident — excluding it would let a forged SHA pass the
+# chain unbroken. Appended at the documented end; ordering is irrelevant to the
+# hash (``sort_keys=True``) but the literal stays append-only by convention.
+TRANSITION_HASH_COLS: tuple[str, ...] = (
+    "id", "task_id", "subtask_id", "from_state", "to_state",
+    "caller_role", "reason", "timestamp", "head_sha",
+)
+
+# Business columns hashed for ``audit_log`` rows (same scheme, own chain).
+AUDIT_HASH_COLS: tuple[str, ...] = (
+    "id", "ts", "event_type", "task_id", "subtask_id", "payload",
+    "actor_cwd", "actor_pid", "actor_role",
+)
+
+
+def compute_row_hash(
+    row: dict[str, Any] | sqlite3.Row,
+    cols: tuple[str, ...],
+    prev_hash: str,
+) -> str:
+    """Return the canonical ``row_hash`` for a chain row.
+
+    ``row`` supplies every column named in ``cols`` (a dict or a
+    :class:`sqlite3.Row`); the canonical payload is exactly those business
+    columns plus ``prev_hash``, JSON-serialized with ``sort_keys=True`` and
+    UTF-8 encoded. Used identically by the writers (``fsm.transition`` and the
+    audit append) and the verifiers (``cb verify-log``, the watchdog), so a row
+    written and a row re-read hash to the same value iff no business column was
+    edited after the fact.
+    """
+    business = {c: row[c] for c in cols}
+    business["prev_hash"] = prev_hash
+    blob = json.dumps(business, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+@dataclass
+class ChainVerifyResult:
+    """Outcome of verifying one hash chain (full or incremental).
+
+    ``ok`` is the verdict; ``row_count`` and ``head_hash`` / ``head_id`` are the
+    chain's tip (for the OK report and the watchdog's remembered head). On a
+    break, ``broken_id`` / ``expected_hash`` / ``actual_hash`` name the first
+    row whose recomputed hash disagrees with what is stored. ``head_regressed``
+    is set by the incremental verifier when the previously-verified tip is gone
+    or rewritten (truncation) — a pure forward walk cannot see that.
+    """
+
+    ok: bool
+    row_count: int = 0
+    head_id: int = 0
+    head_hash: str | None = None
+    broken_id: int | None = None
+    expected_hash: str | None = None
+    actual_hash: str | None = None
+    head_regressed: bool = False
+
+
+def verify_chain(
+    conn: sqlite3.Connection,
+    table: str,
+    cols: tuple[str, ...],
+    *,
+    after_id: int = 0,
+    prev_hash: str | None = None,
+) -> ChainVerifyResult:
+    """Walk ``table``'s chain in ``id`` order and verify hash continuity.
+
+    Full walk (``after_id=0``): starts from the genesis ``prev_hash`` and
+    recomputes every row. Incremental walk (``after_id>0``, ``prev_hash`` =
+    the row_hash remembered for ``after_id``): verifies only rows with
+    ``id > after_id``, linking the first new row's ``prev_hash`` to the
+    remembered head. Returns the first broken row (if any) and the resulting
+    tip; an empty range is vacuously OK with the passed-in head carried
+    forward. Read-only; the caller owns the connection.
+    """
+    rows = conn.execute(
+        f"SELECT * FROM {table} WHERE id > ? ORDER BY id ASC",  # noqa: S608 — table is a fixed literal
+        (after_id,),
+    ).fetchall()
+    expected_prev = GENESIS_PREV_HASH if prev_hash is None else prev_hash
+    head_id = after_id
+    head_hash = prev_hash
+    count = 0
+    for row in rows:
+        stored_prev = row["prev_hash"]
+        stored_hash = row["row_hash"]
+        recomputed = compute_row_hash(row, cols, expected_prev)
+        if stored_prev != expected_prev or stored_hash != recomputed:
+            return ChainVerifyResult(
+                ok=False,
+                row_count=count,
+                head_id=head_id,
+                head_hash=head_hash,
+                broken_id=row["id"],
+                expected_hash=recomputed,
+                actual_hash=stored_hash,
+            )
+        count += 1
+        head_id = row["id"]
+        head_hash = stored_hash
+        expected_prev = stored_hash
+    return ChainVerifyResult(
+        ok=True, row_count=count, head_id=head_id, head_hash=head_hash,
+    )
+
+
+def write_chained_transition(
+    conn: sqlite3.Connection,
+    *,
+    subtask_id: str,
+    task_id: str,
+    from_state: str,
+    to_state: str,
+    caller_role: str,
+    timestamp: str,
+    reason: str,
+    head_sha: str | None,
+) -> None:
+    """Append one hash-chained ``transition_log`` row on an open connection.
+
+    The sole writer of ``transition_log``. Called from inside
+    :func:`fsm.transition`'s ``BEGIN EXCLUSIVE`` transaction (the lock already
+    serializes writers, so the read-prev-head → insert → hash sequence is
+    race-free). Inserts the row, reads the prior chain head's ``row_hash``
+    (genesis if this is the first row), computes ``row_hash`` over the row's
+    business columns plus that ``prev_hash``, and writes both hash columns
+    back. Centralizing it here keeps the canonical serialization identical to
+    what :func:`verify_chain` recomputes.
+    """
+    cur = conn.execute(
+        "INSERT INTO transition_log "
+        "(subtask_id, task_id, from_state, to_state, caller_role, "
+        "timestamp, reason, head_sha) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (subtask_id, task_id, from_state, to_state, caller_role,
+         timestamp, reason, head_sha),
+    )
+    new_id = cur.lastrowid
+    prev = conn.execute(
+        "SELECT row_hash FROM transition_log "
+        "WHERE id < ? AND row_hash IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (new_id,),
+    ).fetchone()
+    prev_hash = prev[0] if prev is not None else GENESIS_PREV_HASH
+    business = {
+        "id": new_id,
+        "task_id": task_id,
+        "subtask_id": subtask_id,
+        "from_state": from_state,
+        "to_state": to_state,
+        "caller_role": caller_role,
+        "reason": reason,
+        "timestamp": timestamp,
+        "head_sha": head_sha,
+    }
+    row_hash = compute_row_hash(business, TRANSITION_HASH_COLS, prev_hash)
+    conn.execute(
+        "UPDATE transition_log SET prev_hash = ?, row_hash = ? WHERE id = ?",
+        (prev_hash, row_hash, new_id),
+    )
+
+
+def _actor_context() -> tuple[str, int, str | None]:
+    """Capture the writing process's actor context for an audit row.
+
+    ``(cwd, pid, role)`` — role from ``$CODEBAND_ROLE`` (set per spawned agent
+    session by the runner; ``None`` on the human-operator path). This answers
+    the row-5 forensics question ("which process ran this?") for the sanctioned
+    CLI surface. Actions OUTSIDE the CLI (raw ``sqlite3``, shell ``git``) write
+    no audit row — the adversary line we do not defend.
+    """
+    return os.getcwd(), os.getpid(), os.environ.get("CODEBAND_ROLE")
 
 
 @dataclass
@@ -184,7 +395,33 @@ CREATE TABLE IF NOT EXISTS transition_log (
     caller_role TEXT NOT NULL,
     timestamp   TEXT NOT NULL,
     reason      TEXT,
-    head_sha    TEXT
+    head_sha    TEXT,
+    -- Hash chain (Stage-3): row_hash = SHA-256 over the canonical business
+    -- columns (see TRANSITION_HASH_COLS) plus prev_hash. Single global chain
+    -- ordered by id; genesis prev_hash = GENESIS_PREV_HASH. Nullable so the
+    -- guarded migration can ADD the columns and backfill in id order.
+    prev_hash   TEXT,
+    row_hash    TEXT
+);
+
+-- Append-only audit of NON-transition effects (approval grants,
+-- approval-request markers, pr_number bindings, ungated_external_merge).
+-- Kept SEPARATE from transition_log so the watchdog's transition patrols keep
+-- their "FSM transitions only" reading. Own hash chain (AUDIT_HASH_COLS),
+-- genesis prev_hash = GENESIS_PREV_HASH. ``actor_*`` capture the writing
+-- process for the row-5 forensics question ("which process ran this?").
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    task_id     TEXT,
+    subtask_id  TEXT,
+    payload     TEXT,
+    actor_cwd   TEXT,
+    actor_pid   INTEGER,
+    actor_role  TEXT,
+    prev_hash   TEXT NOT NULL,
+    row_hash    TEXT NOT NULL
 );
 
 -- Every hot transition_log query (merge-eligibility legs, the watchdog's
@@ -308,6 +545,40 @@ class StateStore:
         }
         if "head_sha" not in log_cols:
             conn.execute("ALTER TABLE transition_log ADD COLUMN head_sha TEXT")
+        # Hash-chain columns (Stage-3). Added nullable, then backfilled over
+        # existing rows in id order so a pre-Stage-3 history becomes a valid
+        # chain AS OF this migration — pre-migration history is attested as of
+        # now, not from origin (a row deleted before the migration leaves no
+        # trace to detect). New rows are chained at write time by the FSM.
+        if "prev_hash" not in log_cols:
+            conn.execute("ALTER TABLE transition_log ADD COLUMN prev_hash TEXT")
+        if "row_hash" not in log_cols:
+            conn.execute("ALTER TABLE transition_log ADD COLUMN row_hash TEXT")
+        if "prev_hash" not in log_cols or "row_hash" not in log_cols:
+            StateStore._backfill_transition_chain(conn)
+
+    @staticmethod
+    def _backfill_transition_chain(conn: sqlite3.Connection) -> None:
+        """Compute the hash chain over existing ``transition_log`` rows in id order.
+
+        Run once, from :meth:`_migrate`, when the chain columns were just
+        added. Walks every row oldest-first, linking each to the prior row's
+        ``row_hash`` (genesis for the first), and writes ``prev_hash`` /
+        ``row_hash``. Idempotent in effect — only rows missing a ``row_hash``
+        are (re)written, so a partially-backfilled DB completes cleanly.
+        """
+        rows = conn.execute(
+            "SELECT * FROM transition_log ORDER BY id ASC"
+        ).fetchall()
+        prev_hash = GENESIS_PREV_HASH
+        for row in rows:
+            row_hash = compute_row_hash(row, TRANSITION_HASH_COLS, prev_hash)
+            conn.execute(
+                "UPDATE transition_log SET prev_hash = ?, row_hash = ? "
+                "WHERE id = ?",
+                (prev_hash, row_hash, row["id"]),
+            )
+            prev_hash = row_hash
 
     # ── tasks ──────────────────────────────────────────────────────────────
 
@@ -434,6 +705,110 @@ class StateStore:
             )
             return "inserted"
 
+    # ── audit log (Stage-3 evidence integrity) ─────────────────────────────
+
+    @staticmethod
+    def _append_audit_on_conn(
+        conn: sqlite3.Connection,
+        *,
+        event_type: str,
+        task_id: str | None,
+        subtask_id: str | None,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        """Append one hash-chained ``audit_log`` row on an open connection.
+
+        The shared writer behind :meth:`append_audit_event` and the in-line
+        audit appends inside other store mutations (grant / marker / pr_number),
+        so an audit row lands in the SAME transaction as the effect it records.
+        Captures actor context, links to the prior audit-chain head (genesis if
+        first), and computes ``row_hash`` over the audit business columns. The
+        caller's transaction must already hold the write lock (the ``audit_log``
+        chain is global, so the read-prev → insert → hash sequence must be
+        serialized — every caller uses ``BEGIN IMMEDIATE``/``EXCLUSIVE``).
+        """
+        cwd, pid, role = _actor_context()
+        payload_json = json.dumps(payload, sort_keys=True) if payload is not None else None
+        ts = _now_iso()
+        cur = conn.execute(
+            "INSERT INTO audit_log "
+            "(ts, event_type, task_id, subtask_id, payload, "
+            "actor_cwd, actor_pid, actor_role, prev_hash, row_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '')",
+            (ts, event_type, task_id, subtask_id, payload_json, cwd, pid, role),
+        )
+        new_id = cur.lastrowid
+        prev = conn.execute(
+            "SELECT row_hash FROM audit_log "
+            "WHERE id < ? ORDER BY id DESC LIMIT 1",
+            (new_id,),
+        ).fetchone()
+        prev_hash = prev[0] if prev is not None else GENESIS_PREV_HASH
+        business = {
+            "id": new_id,
+            "ts": ts,
+            "event_type": event_type,
+            "task_id": task_id,
+            "subtask_id": subtask_id,
+            "payload": payload_json,
+            "actor_cwd": cwd,
+            "actor_pid": pid,
+            "actor_role": role,
+        }
+        row_hash = compute_row_hash(business, AUDIT_HASH_COLS, prev_hash)
+        conn.execute(
+            "UPDATE audit_log SET prev_hash = ?, row_hash = ? WHERE id = ?",
+            (prev_hash, row_hash, new_id),
+        )
+
+    @contextmanager
+    def _immediate_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Like :meth:`_transaction` but acquires the write lock immediately.
+
+        ``BEGIN IMMEDIATE`` serializes the read-prev-head → insert → hash
+        sequence the audit chain needs against concurrent writers, closing the
+        fork window a ``DEFERRED`` transaction would leave between the head
+        read and the insert.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        with closing(conn):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def append_audit_event(
+        self,
+        event_type: str,
+        *,
+        task_id: str | None = None,
+        subtask_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Append a standalone hash-chained ``audit_log`` event.
+
+        The public entry point for callers outside the store (e.g. the merge
+        leg's ``ungated_external_merge`` event). Opens its own
+        ``BEGIN IMMEDIATE`` transaction; for an audit row that must be atomic
+        with another store mutation, that mutation calls
+        :meth:`_append_audit_on_conn` on its own connection instead.
+        """
+        with self._immediate_transaction() as conn:
+            self._append_audit_on_conn(
+                conn,
+                event_type=event_type,
+                task_id=task_id,
+                subtask_id=subtask_id,
+                payload=payload,
+            )
+
     def get_task(self, task_id: str) -> TaskRow | None:
         """Return the task row, or ``None`` if it does not exist."""
         with self._transaction() as conn:
@@ -536,13 +911,21 @@ class StateStore:
         Written by ``cb-phase merge`` on its first invocation (the only leg
         that needs the binding durably): the crash-reconcile path re-invokes
         with no arguments and reads this back to query the PR's state. Also
-        feeds the watchdog's existing PR-activity progress signal.
+        feeds the watchdog's existing PR-activity progress signal. Each binding
+        appends an ``audit_log`` row in the same transaction (Stage-3).
         """
-        with self._transaction() as conn:
+        with self._immediate_transaction() as conn:
             conn.execute(
                 "UPDATE subtask_states SET pr_number = ?, updated_at = ? "
                 "WHERE task_id = ? AND subtask_id = ?",
                 (pr_number, _now_iso(), task_id, subtask_id),
+            )
+            self._append_audit_on_conn(
+                conn,
+                event_type="pr_number_binding",
+                task_id=task_id,
+                subtask_id=subtask_id,
+                payload={"pr_number": pr_number},
             )
 
     def record_merge_approval(
@@ -560,14 +943,24 @@ class StateStore:
         ``cb-phase merge`` executes only when it equals the SHA recorded on
         the ``merge_pending`` transition, so a push after approval (or a grant
         from a pre-rebase round) can never authorize a different commit.
-        Re-approval overwrites the previous grant (latest grant wins).
+        Re-approval overwrites the previous grant on the live columns (latest
+        grant wins) — but grant HISTORY is append-only in ``audit_log`` (a row
+        per grant, Stage-3), so re-approval no longer erases the prior grant
+        from the record.
         """
-        with self._transaction() as conn:
+        with self._immediate_transaction() as conn:
             conn.execute(
                 "UPDATE subtask_states "
                 "SET merge_approved_by = ?, merge_approved_sha = ?, "
                 "updated_at = ? WHERE task_id = ? AND subtask_id = ?",
                 (approved_by, approved_sha, _now_iso(), task_id, subtask_id),
+            )
+            self._append_audit_on_conn(
+                conn,
+                event_type="approval_grant",
+                task_id=task_id,
+                subtask_id=subtask_id,
+                payload={"approved_by": approved_by, "approved_sha": approved_sha},
             )
 
     def mark_merge_approval_requested(
@@ -578,14 +971,22 @@ class StateStore:
         Called by ``cb-phase merge`` strictly *after* a successful request
         send (marker-after-send — a failed send retries on the next
         invocation). SHA-scoped: a later ``merge_pending`` round at a new SHA
-        compares unequal and re-requests.
+        compares unequal and re-requests. Appends an ``audit_log`` row for the
+        marker write in the same transaction (Stage-3).
         """
-        with self._transaction() as conn:
+        with self._immediate_transaction() as conn:
             conn.execute(
                 "UPDATE subtask_states "
                 "SET merge_approval_requested_sha = ?, updated_at = ? "
                 "WHERE task_id = ? AND subtask_id = ?",
                 (requested_sha, _now_iso(), task_id, subtask_id),
+            )
+            self._append_audit_on_conn(
+                conn,
+                event_type="approval_request",
+                task_id=task_id,
+                subtask_id=subtask_id,
+                payload={"requested_sha": requested_sha},
             )
 
     def find_subtasks_by_pr(self, task_id: str, pr_number: int) -> list[SubtaskRow]:
