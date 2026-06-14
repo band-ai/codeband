@@ -578,3 +578,73 @@ def test_rebase_rounds_migrated_onto_legacy_subtask_table(tmp_path: Path) -> Non
     legacy = store.get_subtask("st-1", "old-1")
     assert legacy is not None
     assert legacy.rebase_rounds == 0  # backfilled, no KeyError
+
+
+# ── batch_latest_transitions ─────────────────────────────────────────────────
+
+def _insert_transition_log(store: StateStore, subtask_id: str, task_id: str, timestamp: str) -> None:
+    conn = sqlite3.connect(store.db_path)
+    conn.execute(
+        "INSERT INTO transition_log "
+        "(subtask_id, task_id, from_state, to_state, caller_role, timestamp) "
+        "VALUES (?, ?, 'planned', 'in_progress', 'conductor', ?)",
+        (subtask_id, task_id, timestamp),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_batch_latest_transitions_returns_max_per_subtask(store: StateStore) -> None:
+    store.create_task("t-1", "task one", "room-1")
+    store.create_task("t-2", "task two", "room-2")
+    store.ensure_subtask("st-a", "t-1", state="in_progress")
+    store.ensure_subtask("st-b", "t-1", state="review_pending")
+    store.ensure_subtask("st-c", "t-2", state="in_progress")
+
+    _insert_transition_log(store, "st-a", "t-1", "2026-01-01T10:00:00+00:00")
+    _insert_transition_log(store, "st-a", "t-1", "2026-01-01T11:00:00+00:00")  # newer
+    _insert_transition_log(store, "st-c", "t-2", "2026-01-01T09:00:00+00:00")
+
+    keys = [("t-1", "st-a"), ("t-1", "st-b"), ("t-2", "st-c")]
+    result = store.batch_latest_transitions(keys)
+
+    from datetime import timezone
+    assert ("t-1", "st-a") in result
+    assert result[("t-1", "st-a")].replace(tzinfo=timezone.utc) is not None
+    assert result[("t-1", "st-a")].hour == 11  # MAX picks the newer timestamp
+
+    # st-b has no rows — key absent from result (no rows to GROUP BY on)
+    assert ("t-1", "st-b") not in result
+
+    assert ("t-2", "st-c") in result
+    assert result[("t-2", "st-c")].hour == 9
+
+
+def test_batch_latest_transitions_scopes_by_task_id(store: StateStore) -> None:
+    """Same subtask_id in two tasks must not cross-contaminate results."""
+    store.create_task("t-1", "task one", "room-1")
+    store.create_task("t-2", "task two", "room-2")
+    store.ensure_subtask("st-1", "t-1", state="in_progress")
+    store.ensure_subtask("st-1", "t-2", state="in_progress")
+
+    _insert_transition_log(store, "st-1", "t-1", "2026-01-01T10:00:00+00:00")
+    _insert_transition_log(store, "st-1", "t-2", "2026-01-01T12:00:00+00:00")
+
+    result_t1 = store.batch_latest_transitions([("t-1", "st-1")])
+    result_t2 = store.batch_latest_transitions([("t-2", "st-1")])
+
+    assert result_t1[("t-1", "st-1")].hour == 10
+    assert result_t2[("t-2", "st-1")].hour == 12
+
+
+def test_batch_latest_transitions_empty_input(store: StateStore) -> None:
+    assert store.batch_latest_transitions([]) == {}
+
+
+def test_batch_latest_transitions_no_rows_returns_empty(store: StateStore) -> None:
+    store.create_task("t-1", "task one", "room-1")
+    store.ensure_subtask("st-a", "t-1", state="in_progress")
+
+    result = store.batch_latest_transitions([("t-1", "st-a")])
+    # No transition_log rows — subtask absent from result
+    assert ("t-1", "st-a") not in result

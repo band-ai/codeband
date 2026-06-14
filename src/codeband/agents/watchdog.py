@@ -155,6 +155,10 @@ _PATROLLED_SUBTASK_STATES: frozenset[str] = frozenset(
     }
 )
 
+# Sentinel: distinguishes "transition timestamp pre-fetched as None (no rows)"
+# from "not pre-fetched at all (fall back to per-subtask query)".
+_TRANSITION_UNSET = object()
+
 
 # Free-tier recency-probe paging. The agent message API pages OLDEST-first
 # (default page_size 20, max 100) with no ``since`` parameter, so the probe
@@ -859,21 +863,44 @@ class WatchdogDaemon:
 
         active_task_ids = await asyncio.to_thread(self._active_task_ids)
 
-        for sub in subtasks:
-            # Active-only: a subtask of a superseded/closed task is dead to
-            # the watchdog. None (read failure) degrades to no filtering.
-            if active_task_ids is not None and sub.task_id not in active_task_ids:
-                continue
-            if sub.state not in _PATROLLED_SUBTASK_STATES:
-                continue
+        patrolled = [
+            sub for sub in subtasks
+            if (active_task_ids is None or sub.task_id in active_task_ids)
+            and sub.state in _PATROLLED_SUBTASK_STATES
+        ]
+
+        # Batch-fetch latest transition timestamps for all patrolled subtasks in
+        # one query (N+1 elimination). On success, fill None for subtasks with
+        # no rows so every key is present → _check_one_subtask uses the batch
+        # result. On failure the dict stays empty and _check_one_subtask falls
+        # back to its own per-subtask _latest_transition call.
+        transition_batch: dict[tuple[str, str], Any] = {}
+        try:
+            transition_batch = await asyncio.to_thread(
+                self._store.batch_latest_transitions,
+                [(sub.task_id, sub.subtask_id) for sub in patrolled],
+            )
+            # Pre-populate None for subtasks absent from the result (no rows yet).
+            for _sub in patrolled:
+                _key = (_sub.task_id, _sub.subtask_id)
+                if _key not in transition_batch:
+                    transition_batch[_key] = None
+        except Exception:
+            logger.debug("Watchdog batch transition fetch failed", exc_info=True)
+
+        _unset = _TRANSITION_UNSET
+        for sub in patrolled:
             try:
-                await self._check_one_subtask(sub, now)
+                prefetched = transition_batch.get((sub.task_id, sub.subtask_id), _unset)
+                await self._check_one_subtask(sub, now, prefetched_transition_ts=prefetched)
             except Exception:
                 logger.exception(
                     "Watchdog subtask-progress check failed for %s", sub.subtask_id,
                 )
 
-    async def _check_one_subtask(self, sub: Any, now: datetime) -> None:
+    async def _check_one_subtask(
+        self, sub: Any, now: datetime, *, prefetched_transition_ts: Any = _TRANSITION_UNSET,
+    ) -> None:
         """Evaluate mechanical progress for a single in-flight subtask."""
         import asyncio
 
@@ -916,9 +943,13 @@ class WatchdogDaemon:
             if pr_ts is None:
                 reads_failed += 1
         reads_attempted += 1
-        transition_ok, transition_ts = await asyncio.to_thread(
-            self._latest_transition, sub.subtask_id, sub.task_id,
-        )
+        if prefetched_transition_ts is not _TRANSITION_UNSET:
+            transition_ok = True
+            transition_ts = prefetched_transition_ts
+        else:
+            transition_ok, transition_ts = await asyncio.to_thread(
+                self._latest_transition, sub.subtask_id, sub.task_id,
+            )
         if not transition_ok:
             reads_failed += 1
         # Newest of the two timestamped signals (PR update vs. transition log).
@@ -1290,7 +1321,22 @@ class WatchdogDaemon:
         }
         self._owner_escalated &= currently_blocked_keys
 
-        active_task_ids = await asyncio.to_thread(self._active_task_ids)
+        # Fetch task rows once to derive both active_task_ids and the
+        # room/owner lookup, avoiding per-subtask get_task calls (N+1
+        # elimination). _task_rows returns None on failure → degrade gracefully.
+        task_rows = await asyncio.to_thread(self._task_rows)
+        if task_rows is not None:
+            active_task_ids: set[str] | None = {
+                tid for tid, _, status, _ in task_rows if status == "active"
+            }
+            # task_id → (room_id, owner_id)
+            task_info: dict[str, tuple[str | None, str | None]] = {
+                tid: (room_id_r, owner_id_r)
+                for tid, room_id_r, _, owner_id_r in task_rows
+            }
+        else:
+            active_task_ids = None
+            task_info = {}
 
         for sub in subtasks:
             key = (sub.task_id, sub.subtask_id)
@@ -1300,15 +1346,13 @@ class WatchdogDaemon:
             # escalated — no owner or room resolution is even attempted.
             if active_task_ids is not None and sub.task_id not in active_task_ids:
                 continue
-            # Resolve the owner from the subtask's task row (set at kickoff),
-            # falling back to the constructor override. Do this BEFORE any
-            # marker burn: with no resolvable owner there is nobody to mention
-            # and with no room there is nowhere to post — both skip without
-            # consuming the marker, so the subtask can still escalate later.
-            owner_id = await self._resolve_owner_id(sub.task_id)
+            # Resolve owner and room from pre-fetched task info (avoids per-subtask
+            # get_task calls). Fall back to constructor override for owner.
+            info = task_info.get(sub.task_id)
+            owner_id = (info[1] if info else None) or self._owner_id
             if owner_id is None:
                 continue
-            room_id = await self._resolve_room_id(sub.task_id)
+            room_id = info[0] if info else None
             if room_id is None:
                 continue
             # Marker-after-send: burn escalate-once only when the send lands

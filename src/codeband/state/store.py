@@ -1023,6 +1023,40 @@ class StateStore:
             rows = conn.execute(sql, params).fetchall()
         return [_subtask_from_row(row) for row in rows]
 
+    def batch_latest_transitions(
+        self,
+        subtask_keys: list[tuple[str, str]],
+    ) -> dict[tuple[str, str], datetime | None]:
+        """Return the latest transition timestamp for each (task_id, subtask_id) pair.
+
+        A single query replaces N per-subtask ``_latest_transition`` calls in the
+        watchdog patrol (N+1 elimination). Keys present in the result but with a
+        ``None`` value had no ``transition_log`` rows yet. Keys absent from the
+        result were not found (treat as no rows, i.e. ``None``). Raises on DB
+        error so the caller can decide whether to fall back.
+        """
+        if not subtask_keys:
+            return {}
+        conditions = " OR ".join(
+            "(task_id = ? AND subtask_id = ?)" for _ in subtask_keys
+        )
+        params: list[Any] = [v for (tid, sid) in subtask_keys for v in (tid, sid)]
+        sql = (
+            f"SELECT task_id, subtask_id, MAX(timestamp) "
+            f"FROM transition_log WHERE {conditions} "
+            f"GROUP BY task_id, subtask_id"
+        )
+        with self._transaction() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        result: dict[tuple[str, str], datetime | None] = {}
+        for row in rows:
+            key = (row[0], row[1])
+            try:
+                result[key] = datetime.fromisoformat(row[2]) if row[2] is not None else None
+            except (ValueError, TypeError):
+                result[key] = None
+        return result
+
 
 def _task_from_row(row: sqlite3.Row) -> TaskRow:
     # ``owner_id`` / ``owner_handle`` may be absent on rows fetched before the
