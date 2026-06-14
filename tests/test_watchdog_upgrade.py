@@ -1211,7 +1211,11 @@ async def test_all_signal_reads_failed_does_not_count(tmp_path, monkeypatch):
 
     rest = _mock_rest()
     daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
-    # Sever the one remaining signal: the transition-log read itself fails.
+    # Sever the transition-log signal: both the batch path and the per-subtask
+    # fallback must fail so the patrol sees a total-read-failure.
+    monkeypatch.setattr(
+        store, "batch_latest_transitions", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
     monkeypatch.setattr(
         daemon, "_latest_transition", lambda subtask_id, task_id: (False, None),
     )
@@ -1264,6 +1268,11 @@ async def test_no_data_counter_resets_on_recovery(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", _run)
     daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=10))
+    # Sever both the batch path and the per-subtask fallback so the first patrol
+    # has no transition-log data at all (total degraded read).
+    monkeypatch.setattr(
+        store, "batch_latest_transitions", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
     monkeypatch.setattr(
         daemon, "_latest_transition", lambda subtask_id, task_id: (False, None),
     )
@@ -1273,6 +1282,9 @@ async def test_no_data_counter_resets_on_recovery(tmp_path, monkeypatch):
     health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
     assert health.no_data_patrols == 1
 
+    # Recovery: restore the DB so the batch can succeed on the next patrol.
+    monkeypatch.undo()
+    monkeypatch.setattr(subprocess, "run", _run)
     failing["on"] = False
     await daemon._check_subtask_progress(now)
     assert health.no_data_patrols == 0
@@ -1939,3 +1951,103 @@ async def test_owner_reescalates_after_resume_and_reblock(tmp_path):
     await daemon._check_blocked_subtasks(datetime.now(UTC))
 
     assert rest.agent_api_messages.create_agent_chat_message.await_count == 2
+
+
+# ── batch_latest_transitions used in progress patrol (T-06) ─────────────────
+
+@pytest.mark.asyncio
+async def test_progress_patrol_uses_batch_transitions(tmp_path, monkeypatch):
+    """_check_subtask_progress pre-fetches all transition timestamps in one
+    batch query instead of one per subtask (N+1 elimination). Verify the
+    batch path is exercised by monkeypatching _latest_transition to fail if
+    called — a patrol against a store with no transition rows must still
+    complete without error via the batch (empty result → ok=True, ts=None).
+    """
+    store = _seed_store(tmp_path)
+    # No git HEAD changes so we can focus purely on transition-log behaviour.
+    monkeypatch.setattr(subprocess, "run", _make_run({"head": "abc", "pr_updated": BASELINE_PR_TS}))
+
+    config = WatchdogConfig(max_phase_visits=10, git_progress_check=True)
+    daemon = _daemon(store, config=config)
+
+    # Patch _latest_transition to raise — if the batch path is working, this
+    # method should never be called during the patrol.
+    def _boom(*a, **kw):
+        raise AssertionError("_latest_transition should not be called when batch succeeds")
+
+    monkeypatch.setattr(daemon, "_latest_transition", _boom)
+
+    # Should complete without raising.
+    await daemon._check_subtask_progress(datetime.now(UTC))
+
+    # Baseline patrol with no prior head recorded counts as progress (no stall).
+    health = daemon._subtask_state.get((TASK_ID, SUBTASK_ID))
+    assert health is not None
+    assert health.patrol_visits_without_progress == 0
+
+
+@pytest.mark.asyncio
+async def test_progress_patrol_falls_back_when_batch_fails(tmp_path, monkeypatch):
+    """When batch_latest_transitions raises, the patrol falls back to
+    per-subtask _latest_transition calls so results are still correct."""
+    store = _seed_store(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _make_run({"head": "abc", "pr_updated": BASELINE_PR_TS}))
+
+    config = WatchdogConfig(max_phase_visits=10, git_progress_check=True)
+    daemon = _daemon(store, config=config)
+
+    # Simulate batch failure.
+    monkeypatch.setattr(store, "batch_latest_transitions", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db error")))
+
+    # Should complete without raising — fallback per-subtask path fires.
+    await daemon._check_subtask_progress(datetime.now(UTC))
+
+    health = daemon._subtask_state.get((TASK_ID, SUBTASK_ID))
+    assert health is not None  # patrol still ran
+
+
+# ── _check_blocked_subtasks uses task_rows batch (T-06) ─────────────────────
+
+def _owner_daemon_no_override(store, rest):
+    """Daemon with no owner_id override — owner must come from task row."""
+    from codeband.agents.watchdog import WatchdogDaemon
+
+    return WatchdogDaemon(
+        config=WatchdogConfig(),
+        rest_client=rest,
+        agent_id="agent-wd",
+        conductor_id="agent-cond",
+        activity=None,
+        state_store=store,
+    )
+
+
+@pytest.mark.asyncio
+async def test_blocked_subtask_escalation_uses_task_row_batch(tmp_path):
+    """_check_blocked_subtasks resolves owner+room from the pre-fetched
+    _task_rows dict without per-subtask get_task calls."""
+    from codeband.state import StateStore
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id="owner-99")
+    _drive_to_blocked(store)
+
+    rest = _mock_rest()
+    daemon = _owner_daemon_no_override(store, rest)
+
+    # Patch get_task to raise — if the batch path works, it should never be called.
+    original_get_task = store.get_task
+    calls = {"n": 0}
+
+    def _spy(task_id):
+        calls["n"] += 1
+        return original_get_task(task_id)
+
+    store.get_task = _spy
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    # Escalation fired (owner resolved from task_rows, not per-subtask get_task).
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+    # get_task should NOT have been called (batch path used task_rows instead).
+    assert calls["n"] == 0, f"get_task was called {calls['n']} times; expected 0"
