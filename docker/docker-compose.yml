@@ -31,6 +31,7 @@ x-agent-base: &agent-base
     REPO_BRANCH: ${REPO_BRANCH:-}
     WORKTREE_PREFIX: ${WORKTREE_PREFIX:-codeband}
     BAND_MEMORY_MODE: ${BAND_MEMORY_MODE:-}
+    BAND_API_KEY: ${BAND_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -202,6 +203,31 @@ services:
       <<: *env-base
       AGENT_KEY: reviewer-codex-0
       AGENT_ROLE: reviewer
+    volumes: *volumes-codex
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Verifier-Claude-0 (pool — pairs with Codex coders) ────────────────
+  verifier-claude-0:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: verifier-claude_sdk-0
+      AGENT_ROLE: verifier
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Verifier-Codex-0 (pool — pairs with Claude coders) ─────────────────
+  verifier-codex-0:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.codex
+    environment:
+      <<: *env-base
+      AGENT_KEY: verifier-codex-0
+      AGENT_ROLE: verifier
     volumes: *volumes-codex
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
