@@ -258,7 +258,13 @@ def _default_reviewers_pool() -> ReviewersConfig:
 
 
 class VerifiersConfig(_StrictModel):
-    """Evidence integrity verifier pool.
+    """Verifier pool — dual-mandate governance gate (PR #63).
+
+    The Verifier carries a dual mandate: (1) contract conformance — the solution
+    actually satisfies the registered acceptance criteria; and (2) evidence
+    integrity — the durable evidence (PR body, collected counts, SHAs) is
+    truthful and matches reality. Both axes are governance duties, opposite-vendor
+    by design; a legitimate veto on either axis is authoritative.
 
     Mirrors ReviewersConfig in shape (no review_guidelines). The verdict leg is
     wired (``cb-phase verify-acceptance``) and the Verifier runtime + dispatch
@@ -361,12 +367,13 @@ class AgentsConfig(_StrictModel):
     # to ``in_progress`` for another rework cycle — the only legal move is
     # ``blocked`` (escalation). Bounds a *productive* review loop (real commits
     # each round, HEAD advancing) that the watchdog's stall cap
-    # (``watchdog.max_phase_visits``) by design never fires on. Default 3 matches
-    # band-of-devs' ``max_phase_visits`` and the 2-3-round review plateau. Wired
-    # into ``fsm.transition`` via ``max_review_rounds`` (default
-    # ``fsm.MAX_REVIEW_ROUNDS``); the live caller lands with P5 activation.
+    # (``watchdog.max_phase_visits``) by design never fires on. Default 6 was
+    # validated in dogfood: the previous default of 3 false-blocked productive PRs
+    # on their third round; 6 reflects the observed 4-6-round plateau for
+    # non-trivial changes. Wired into ``fsm.transition`` via ``max_review_rounds``
+    # (default ``fsm.MAX_REVIEW_ROUNDS``); the live caller lands with P5 activation.
     # ge=1: a zero would block every subtask at its first review.
-    max_review_rounds: int = Field(default=3, ge=1)
+    max_review_rounds: int = Field(default=6, ge=1)
 
     # Per-subtask verify-attempt cap (RFC two-level model). Once a subtask has
     # had this many ``cb-phase verify`` attempts *rejected* (a failed gate: dirty
