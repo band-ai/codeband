@@ -623,6 +623,23 @@ def test_invalid_entry_state_is_a_clear_error(env, capsys):
     assert "not a valid entry state" in capsys.readouterr().err
 
 
+def test_already_merged_subtask_is_noop_not_error(env, capsys):
+    """A duplicate invocation on an already-merged subtask exits 0 with the
+    NO-OP [already_merged] marker — not an illegal-transition error that
+    would invite retries (#fix/noop-merge-leg)."""
+    _grant(env.store)
+    assert _run() == 0  # happy path: queues + executes merge
+    assert env.store.get_subtask("st-1", TASK).state == "merged"
+    capsys.readouterr()  # clear output from first invocation
+
+    # Second invocation on the now-merged subtask.
+    assert _run() == 0
+    out, err = capsys.readouterr()
+    assert "NO-OP [already_merged]" in out
+    assert err == ""
+    assert env.gh_merges == [42]  # no re-merge attempt
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Ungated opt-out: the gate is vacuous, the approval flow is not
 # ─────────────────────────────────────────────────────────────────────────────

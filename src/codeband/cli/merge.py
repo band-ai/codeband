@@ -483,6 +483,14 @@ def _cmd_merge(args: argparse.Namespace) -> int:
 
     subtask = store.get_subtask(args.subtask_id, task_id)
     current = subtask.state if subtask is not None else "planned"
+    if current == "merged":
+        sha = subtask.merge_approved_sha if subtask is not None else None
+        sha_tag = f"@{sha}" if sha else ""
+        print(
+            f"NO-OP [already_merged] {args.subtask_id}{sha_tag} "
+            f"(state: merged); nothing to do"
+        )
+        return 0
     if current not in _ENTRY_STATES:
         print(
             f"cb-phase: subtask {args.subtask_id!r} is in state {current!r}, "
