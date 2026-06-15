@@ -234,7 +234,7 @@ def test_run_agent_forever_survives_activity_log_oserror(tmp_path, monkeypatch):
             )
         )
 
-    # Two crashes were each logged (and each log raised); the loop lived on
-    # to the third cycle regardless.
+    # Two crashes + two reconnect events (cycles 2 and 3) were each logged
+    # (and each log raised); the loop lived on to the third cycle regardless.
     assert cycles["n"] == 3
-    assert _DiskFullActivity.calls == 2
+    assert _DiskFullActivity.calls == 4
