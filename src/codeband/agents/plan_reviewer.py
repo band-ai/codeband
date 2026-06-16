@@ -65,7 +65,7 @@ class CodexPlanReviewerRunner:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4",
+        model: str = "gpt-5.5",
         custom_prompt: str | None = None,
         review_guidelines: str | None = None,
         workspace: str | None = None,
