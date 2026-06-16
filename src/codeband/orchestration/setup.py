@@ -270,6 +270,14 @@ async def register_all_agents(
     # Description drift is only checked under detect_drift=True (cb setup-agents);
     # the cb run auto-bootstrap path skips it so a starting swarm cannot rotate
     # credentials of agents another swarm is using.
+    #
+    # _delete_failures tracks CREDENTIAL_MISMATCH delete failures by display-name.
+    # Only mismatch failures block registration (the platform still owns the name,
+    # so a subsequent _register_agent call would 422). NAME_NO_LONGER_EXPECTED and
+    # DESCRIPTION_DRIFT failures do not cause spurious registers so they are logged
+    # but do not block the run.
+    _delete_failures: dict[str, Exception] = {}
+
     for name, agent in list(platform_agents.items()):
         if not _is_codeband_agent(name):
             continue
@@ -302,12 +310,25 @@ async def register_all_agents(
                 if delete_reason == _DeleteReason.DESCRIPTION_DRIFT and matching_key:
                     existing_config.agents.pop(matching_key, None)
             except Exception as e:
-                logger.warning("Failed to delete agent %s: %s", name, e)
+                logger.error("Failed to delete agent %s (%s): %s", name, delete_reason.value, e)
+                if delete_reason is _DeleteReason.CREDENTIAL_MISMATCH:
+                    # The platform still owns this name. Registering a new agent
+                    # with the same name would 422. Track for skip + deferred raise.
+                    _delete_failures[name] = e
 
     agent_config = AgentConfigFile()
 
     # Reuse or register each expected agent
     for key, (display_name, description) in expected.items():
+        if display_name in _delete_failures:
+            # A CREDENTIAL_MISMATCH delete failed for this name — the platform
+            # agent still owns the slot. Attempting to register the same name
+            # would produce a 422. Skip and surface the failure below.
+            logger.error(
+                "Skipping registration of %s: platform agent could not be deleted", display_name,
+            )
+            continue
+
         existing_creds = existing_config.agents.get(key)
         platform_agent = platform_agents.get(display_name)
 
@@ -337,6 +358,15 @@ async def register_all_agents(
     reused = len(agent_config.agents) - registered
     print(f"\n{len(agent_config.agents)} agents ready ({reused} reused, {registered} registered).")
     print(f"Credentials: {config_path}")
+
+    if _delete_failures:
+        details = "; ".join(f"{n}: {exc!r}" for n, exc in _delete_failures.items())
+        first_exc = next(iter(_delete_failures.values()))
+        raise RuntimeError(
+            f"Could not delete {len(_delete_failures)} stale platform agent(s) with credential "
+            f"mismatches — their names are still occupied on the platform and registration was "
+            f"skipped. Manual cleanup or re-run of 'cb setup-agents' may be required: {details}"
+        ) from first_exc
 
 
 async def _register_agent(

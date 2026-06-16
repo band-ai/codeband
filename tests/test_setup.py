@@ -492,6 +492,166 @@ class TestSetupDriftDetection:
         assert result.agents["coder-codex-0"].api_key == "key-co-x0"
 
 
+class TestSetupDeleteFailure:
+    """When a CREDENTIAL_MISMATCH delete fails, registration must be skipped
+    and the failure surfaced — never silently re-attempting a doomed register."""
+
+    @pytest.mark.asyncio
+    async def test_mismatch_delete_failure_skips_registration_and_raises(self, tmp_path):
+        """Primary regression: mismatch + failed delete must not call _register_agent
+        for the contested name, and must raise RuntimeError mentioning that name."""
+        from codeband.orchestration.setup import register_all_agents
+
+        config = _make_config()
+
+        # Platform has Coder-Claude-0 with id "platform-id";
+        # local config has id "local-id" — credential mismatch.
+        mismatched_agent = FakeAgent(
+            id="platform-id",
+            name="Coder-Claude-0",
+            description=_expected_desc_for(config, "Coder-Claude-0"),
+        )
+        other_agents = [a for a in _platform_agents_for(config) if a.name != "Coder-Claude-0"]
+
+        mismatched_config = AgentConfigFile(agents={
+            **_DEFAULT_AGENT_CONFIG.agents,
+            "coder-claude_sdk-0": AgentCredentials(agent_id="local-id", api_key="key-co-c0"),
+        })
+        mismatched_config.to_yaml(tmp_path / "agent_config.yaml")
+
+        delete_error = RuntimeError("permission denied")
+
+        async def fail_only_mismatch_delete(agent_id, **kwargs):
+            if agent_id == "platform-id":
+                raise delete_error
+            return FakeDeleteResponse(id=agent_id, name="deleted")
+
+        client = AsyncMock()
+        client.human_api_agents.list_my_agents.return_value = FakeListResponse(
+            data=[mismatched_agent] + other_agents,
+        )
+        client.human_api_agents.delete_my_agent.side_effect = fail_only_mismatch_delete
+
+        with pytest.raises(RuntimeError, match="Coder-Claude-0"):
+            await register_all_agents(config, tmp_path, client=client)
+
+        # Key assertion: _register_agent was NOT called for the contested name.
+        registered_names = [
+            call[1]["agent"].name
+            for call in client.human_api_agents.register_my_agent.call_args_list
+        ]
+        assert "Coder-Claude-0" not in registered_names
+
+    @pytest.mark.asyncio
+    async def test_mismatch_delete_failure_does_not_block_other_registrations(self, tmp_path):
+        """Other agents still succeed even when one mismatch-delete fails."""
+        from codeband.orchestration.setup import register_all_agents
+
+        config = _make_config()
+
+        # Platform has Coder-Claude-0 (mismatch) but not Coder-Codex-0 (missing).
+        mismatched_agent = FakeAgent(
+            id="platform-id",
+            name="Coder-Claude-0",
+            description=_expected_desc_for(config, "Coder-Claude-0"),
+        )
+        other_agents = [
+            a for a in _platform_agents_for(config)
+            if a.name not in {"Coder-Claude-0", "Coder-Codex-0"}
+        ]
+
+        # Local config: Coder-Claude-0 has wrong id; Coder-Codex-0 entirely missing.
+        partial_config = AgentConfigFile(agents={
+            k: v for k, v in _DEFAULT_AGENT_CONFIG.agents.items()
+            if k != "coder-codex-0"
+        })
+        partial_config.agents["coder-claude_sdk-0"] = AgentCredentials(
+            agent_id="local-id", api_key="key-co-c0",
+        )
+        partial_config.to_yaml(tmp_path / "agent_config.yaml")
+
+        async def fail_only_mismatch_delete(agent_id, **kwargs):
+            if agent_id == "platform-id":
+                raise RuntimeError("permission denied")
+            return FakeDeleteResponse(id=agent_id, name="deleted")
+
+        register_count = 0
+
+        async def fake_register(*, agent, **kwargs):
+            nonlocal register_count
+            register_count += 1
+            return FakeRegisterResponse(
+                data=FakeRegisterData(
+                    agent=FakeAgent(id=f"new-{register_count}", name=agent.name),
+                    credentials=FakeCredentials(api_key=f"newkey-{register_count}"),
+                )
+            )
+
+        client = AsyncMock()
+        client.human_api_agents.list_my_agents.return_value = FakeListResponse(
+            data=[mismatched_agent] + other_agents,
+        )
+        client.human_api_agents.delete_my_agent.side_effect = fail_only_mismatch_delete
+        client.human_api_agents.register_my_agent.side_effect = fake_register
+
+        with pytest.raises(RuntimeError, match="Coder-Claude-0"):
+            await register_all_agents(config, tmp_path, client=client)
+
+        # Coder-Codex-0 was registered (it was genuinely missing).
+        registered_names = [
+            call[1]["agent"].name
+            for call in client.human_api_agents.register_my_agent.call_args_list
+        ]
+        assert "Coder-Codex-0" in registered_names
+        assert "Coder-Claude-0" not in registered_names
+
+        # The credential file reflects partial success: Coder-Codex-0 has a new id.
+        result = AgentConfigFile.from_yaml(tmp_path / "agent_config.yaml")
+        assert result.agents["coder-codex-0"].agent_id.startswith("new-")
+        # Coder-Claude-0 is absent from the file (was skipped).
+        assert "coder-claude_sdk-0" not in result.agents
+
+    @pytest.mark.asyncio
+    async def test_mismatch_delete_failure_raises_in_detect_drift_false_mode(self, tmp_path):
+        """detect_drift=False (auto-bootstrap) also raises on mismatch + failed delete."""
+        from codeband.orchestration.setup import register_all_agents
+
+        config = _make_config()
+
+        mismatched_agent = FakeAgent(
+            id="platform-id",
+            name="Coder-Claude-0",
+            description=_expected_desc_for(config, "Coder-Claude-0"),
+        )
+        other_agents = [a for a in _platform_agents_for(config) if a.name != "Coder-Claude-0"]
+
+        mismatched_config = AgentConfigFile(agents={
+            **_DEFAULT_AGENT_CONFIG.agents,
+            "coder-claude_sdk-0": AgentCredentials(agent_id="local-id", api_key="key-co-c0"),
+        })
+        mismatched_config.to_yaml(tmp_path / "agent_config.yaml")
+
+        async def fail_only_mismatch_delete(agent_id, **kwargs):
+            if agent_id == "platform-id":
+                raise RuntimeError("permission denied")
+            return FakeDeleteResponse(id=agent_id, name="deleted")
+
+        client = AsyncMock()
+        client.human_api_agents.list_my_agents.return_value = FakeListResponse(
+            data=[mismatched_agent] + other_agents,
+        )
+        client.human_api_agents.delete_my_agent.side_effect = fail_only_mismatch_delete
+
+        with pytest.raises(RuntimeError, match="Coder-Claude-0"):
+            await register_all_agents(config, tmp_path, client=client, detect_drift=False)
+
+        registered_names = [
+            call[1]["agent"].name
+            for call in client.human_api_agents.register_my_agent.call_args_list
+        ]
+        assert "Coder-Claude-0" not in registered_names
+
+
 class TestSetupFreshInstall:
     """When no agents exist, register everything from scratch."""
 
