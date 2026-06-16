@@ -23,7 +23,7 @@ class CodexPlayerRunner:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4",
+        model: str = "gpt-5.5",
         custom_prompt: str | None = None,
         workspace: str | None = None,
         recovery_context: str | None = None,

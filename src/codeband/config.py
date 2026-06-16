@@ -262,7 +262,7 @@ def _default_planners_pool() -> FrameworkPool:
 
 def _default_plan_reviewers_pool() -> PlanReviewersConfig:
     return PlanReviewersConfig(
-        codex=PoolEntry(count=1, model="gpt-5.4"),
+        codex=PoolEntry(count=1, model="gpt-5.5"),
     )
 
 
@@ -273,14 +273,14 @@ def _default_coders_pool() -> FrameworkPool:
     # their lighter workloads.
     return FrameworkPool(
         claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
-        codex=PoolEntry(count=1, model="gpt-5.4"),
+        codex=PoolEntry(count=1, model="gpt-5.5"),
     )
 
 
 def _default_reviewers_pool() -> ReviewersConfig:
     return ReviewersConfig(
         claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
-        codex=PoolEntry(count=1, model="gpt-5.4"),
+        codex=PoolEntry(count=1, model="gpt-5.5"),
     )
 
 
@@ -333,7 +333,7 @@ def _default_verifiers_pool() -> VerifiersConfig:
     # 0 opts back out (merges straight from ``review_passed``, no acceptance).
     return VerifiersConfig(
         claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
-        codex=PoolEntry(count=1, model="gpt-5.4"),
+        codex=PoolEntry(count=1, model="gpt-5.5"),
     )
 
 

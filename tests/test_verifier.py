@@ -69,7 +69,7 @@ class TestVerifiersConfig:
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
         v = config.agents.verifiers
         assert v.claude_sdk.model == "claude-opus-4-7"
-        assert v.codex.model == "gpt-5.4"
+        assert v.codex.model == "gpt-5.5"
 
     def test_active_frameworks_both_by_default(self):
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
@@ -109,7 +109,7 @@ class TestVerifiersConfig:
             agents=AgentsConfig(
                 verifiers=VerifiersConfig(
                     claude_sdk=PoolEntry(count=0, model="claude-opus-4-7"),
-                    codex=PoolEntry(count=1, model="gpt-5.4"),
+                    codex=PoolEntry(count=1, model="gpt-5.5"),
                 ),
             ),
         )
@@ -119,7 +119,7 @@ class TestVerifiersConfig:
         assert loaded.agents.verifiers.claude_sdk.count == 0
         assert loaded.agents.verifiers.claude_sdk.model == "claude-opus-4-7"
         assert loaded.agents.verifiers.codex.count == 1
-        assert loaded.agents.verifiers.codex.model == "gpt-5.4"
+        assert loaded.agents.verifiers.codex.model == "gpt-5.5"
 
     def test_total_agent_count_reflects_verifier_seats(self):
         """total_agent_count counts active verifier seats (independent of the
@@ -179,7 +179,7 @@ class TestVerifierRuntime:
             config, workspace=str(tmp_path), framework=Framework.CODEX,
         ).config
         assert codex_cfg.sandbox == "danger-full-access"
-        assert codex_cfg.model == "gpt-5.4"
+        assert codex_cfg.model == "gpt-5.5"
 
 
 # ─── distributed dispatch + framework-detection wiring ───────────────────────

@@ -82,7 +82,7 @@ class CodexPlannerRunner:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4",
+        model: str = "gpt-5.5",
         custom_prompt: str | None = None,
         workspace: str | None = None,
         worker_roster: str | None = None,

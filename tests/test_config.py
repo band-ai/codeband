@@ -51,7 +51,7 @@ class TestCodebandConfig:
         """
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
         assert config.agents.coders.claude_sdk.model == "claude-opus-4-7"
-        assert config.agents.coders.codex.model == "gpt-5.4"
+        assert config.agents.coders.codex.model == "gpt-5.5"
         assert config.agents.reviewers.claude_sdk.model == "claude-sonnet-4-6"
         assert config.agents.planners.claude_sdk.model == "claude-sonnet-4-6"
         assert config.agents.conductor.model == "claude-sonnet-4-6"
@@ -463,11 +463,11 @@ class TestCodexFrameworkSupport:
         cfg = AgentsConfig(
             planners=FrameworkPool(
                 claude_sdk=PoolEntry(count=0),
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
         )
         assert cfg.planners.codex.count == 1
-        assert cfg.planners.codex.model == "gpt-5.4"
+        assert cfg.planners.codex.model == "gpt-5.5"
 
     def test_planners_claude_only_still_fine(self):
         """The default shape (Claude planner, Codex plan-reviewer) keeps working."""
