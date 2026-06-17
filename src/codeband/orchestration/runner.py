@@ -665,7 +665,9 @@ async def _install_memory_backend(
 
 # ─── workspace path helpers ─────────────────────────────────────────────────
 
-def _export_project_dir_env(project_dir: Path, *, role: str | None = None) -> None:
+def _export_project_dir_env(
+    project_dir: Path, *, role: str | None = None, agent_id: str | None = None
+) -> None:
     """Export ``CODEBAND_PROJECT_DIR`` for every session this process spawns.
 
     ``role`` (Stage-3 attribution): when given, also exports
@@ -698,6 +700,18 @@ def _export_project_dir_env(project_dir: Path, *, role: str | None = None) -> No
     this same process (bare ``cb`` hosts the orchestrator in-process), so the
     guard exempts ``command_style="slash"`` — that path is only reachable
     from the human at the REPL prompt.
+
+    ``agent_id`` (item-0 identity plumbing) rides the same seam in DISTRIBUTED
+    mode, where the process IS one Band agent: it is exported as
+    ``CODEBAND_AGENT_ID`` so the spawned ``cb-phase`` subprocess can stamp the
+    durable ``assigned_worker`` / ``assigned_reviewer`` fields with the real
+    agent_id (``codeband/identity.py``). When ``agent_id`` is NOT given (local
+    ``run_local``, where one process hosts every role and there is no single
+    identity) the var is actively CLEARED — a non-empty ``CODEBAND_AGENT_ID``
+    must reliably mean "single distributed agent", so a stale/inherited value
+    cannot hijack local-mode resolution (which falls through to the
+    worktree/scratch location map instead). Like the role marker, this is a
+    forensic / mention aid, not authentication.
     """
     import os
 
@@ -705,6 +719,10 @@ def _export_project_dir_env(project_dir: Path, *, role: str | None = None) -> No
     os.environ["CODEBAND_AGENT_SESSION"] = "1"
     if role is not None:
         os.environ["CODEBAND_ROLE"] = role
+    if agent_id is not None:
+        os.environ["CODEBAND_AGENT_ID"] = agent_id
+    else:
+        os.environ.pop("CODEBAND_AGENT_ID", None)
 
 
 def _resolve_workspace_config(config: CodebandConfig, project_dir: Path) -> CodebandConfig:
@@ -922,8 +940,17 @@ async def run_local(
     _patch_band_local_runtime()
     _patch_codex_adapter_resilience()
     # Every agent session spawned below inherits the resolved project dir so
-    # cb-phase / cb approve resolve config + state from any cwd.
+    # cb-phase / cb approve resolve config + state from any cwd. No agent_id is
+    # passed (one process hosts every role), which also CLEARS any stale
+    # CODEBAND_AGENT_ID so local-mode identity resolution falls through to the
+    # location map written next.
     _export_project_dir_env(project_dir)
+
+    # item-0 identity plumbing: write the local-mode seat→agent_id map. Local
+    # mode has no per-process env identity, so each spawned cb-phase resolves
+    # its agent_id from the worktree/scratch dir it runs in. Covers every seat
+    # the layout knows so the map is general (not just the two stamp sites).
+    _write_local_location_map(layout, agent_config)
 
     # Resolve memory backend once per process, using the Conductor's creds.
     conductor_creds = agent_config.get("conductor")
@@ -1277,8 +1304,10 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
     # Docker the compose env block already pins this to /app/config — the
     # re-export resolves to the identical path (project_dir IS that dir).
     # Distributed mode IS a single role per process, so we also export
-    # CODEBAND_ROLE here (Stage-3 attribution / cb-phase role gating).
-    _export_project_dir_env(project_dir, role=role)
+    # CODEBAND_ROLE here (Stage-3 attribution / cb-phase role gating) and
+    # CODEBAND_AGENT_ID (item-0): the cb-phase subprocess stamps the durable
+    # assigned_worker / assigned_reviewer with this agent_id.
+    _export_project_dir_env(project_dir, role=role, agent_id=creds.agent_id)
 
     # Resolve memory backend per process.
     probe_client = _create_rest_client(creds.api_key, resolved_config.band.rest_url)
@@ -1469,6 +1498,49 @@ def _role_from_key(key: str) -> str:
         if role in {"planner", "plan_reviewer", "coder", "reviewer", "verifier"}:
             return role
     raise ValueError(f"Cannot derive role from agent key: {key}")
+
+
+def _write_local_location_map(layout, agent_config: dict) -> None:
+    """Write the local-mode seat→agent_id map from the workspace layout.
+
+    item-0 identity plumbing: local mode (``run_local``) hosts every role in one
+    process, so ``cb-phase`` cannot read a per-process ``CODEBAND_AGENT_ID``.
+    Instead each agent's CLI subprocess runs from its own worktree/scratch dir,
+    and :func:`codeband.identity.resolve_identity` maps that cwd back to the
+    seat's agent_id via this file. Every seat the layout exposes is included
+    (planner / plan_reviewer / coder worktrees + reviewer / verifier scratch +
+    mergemaster worktree) so the map is general, not scoped to the two stamp
+    sites. A seat missing from ``agent_config`` (count mismatch) is skipped.
+    """
+    from codeband.identity import write_location_map
+
+    seat_dirs: dict[str, Path] = {}
+    seat_dirs.update(layout.planner_worktrees)
+    seat_dirs.update(layout.plan_reviewer_worktrees)
+    seat_dirs.update(layout.coder_worktrees)
+    seat_dirs.update(layout.reviewer_scratch)
+    seat_dirs.update(layout.verifier_scratch)
+    if layout.mergemaster_worktree is not None:
+        seat_dirs["mergemaster"] = layout.mergemaster_worktree
+
+    entries: list[dict] = []
+    for worker_id, seat_dir in seat_dirs.items():
+        creds = agent_config.get(worker_id)
+        if creds is None:
+            continue
+        try:
+            role = _role_from_key(worker_id)
+        except ValueError:
+            continue
+        entries.append(
+            {
+                "dir": str(seat_dir),
+                "worker_id": worker_id,
+                "agent_id": creds.agent_id,
+                "role": role,
+            }
+        )
+    write_location_map(layout.state_dir, entries)
 
 
 def _framework_from_key(key: str) -> Framework:

@@ -353,6 +353,13 @@ class SubtaskRow:
     # policy as the watchdog escalations). SHA-scoped so a needs_rebase round
     # trip (new merge_pending SHA) naturally re-requests approval.
     merge_approval_requested_sha: str | None = None
+    # ── Durable reviewer identity (item-0) ───────────────────────────────────
+    # The Band agent_id of the reviewer that rendered the LATEST verdict on this
+    # subtask, stamped by ``cb-phase review`` at the verdict site. Companion to
+    # ``assigned_worker`` (the coder's agent_id, stamped at start→in_progress).
+    # Advisory: a forensic / attribution aid, never a gate; ``None`` whenever the
+    # reviewer's identity could not be resolved (the FSM verdict still records).
+    assigned_reviewer: str | None = None
 
 
 _SCHEMA = """
@@ -383,6 +390,7 @@ CREATE TABLE IF NOT EXISTS subtask_states (
     merge_approved_by             TEXT,
     merge_approved_sha            TEXT,
     merge_approval_requested_sha  TEXT,
+    assigned_reviewer             TEXT,
     PRIMARY KEY (task_id, subtask_id)
 );
 
@@ -527,6 +535,10 @@ class StateStore:
             conn.execute(
                 "ALTER TABLE subtask_states "
                 "ADD COLUMN merge_approval_requested_sha TEXT"
+            )
+        if "assigned_reviewer" not in cols:
+            conn.execute(
+                "ALTER TABLE subtask_states ADD COLUMN assigned_reviewer TEXT"
             )
         task_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
@@ -969,6 +981,40 @@ class StateStore:
                 payload={"pr_number": pr_number},
             )
 
+    def set_assigned_worker(
+        self, subtask_id: str, task_id: str, agent_id: str
+    ) -> None:
+        """Stamp the coder's Band agent_id onto the subtask (item-0).
+
+        Written by ``cb-phase start`` when the assigned → in_progress edge is
+        driven by a coder. Advisory (no audit row): the watchdog reads it as a
+        chat-mention id and rehydration shows it for attribution. A plain
+        ``UPDATE`` (same shape as :meth:`set_pr_number`) — last-writer-wins is
+        truthful, and the caller only invokes it with a resolved, non-empty id.
+        """
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE subtask_states SET assigned_worker = ?, updated_at = ? "
+                "WHERE task_id = ? AND subtask_id = ?",
+                (agent_id, _now_iso(), task_id, subtask_id),
+            )
+
+    def set_assigned_reviewer(
+        self, subtask_id: str, task_id: str, agent_id: str
+    ) -> None:
+        """Stamp the reviewer's Band agent_id onto the subtask (item-0).
+
+        Written by ``cb-phase review`` at the verdict site (approve or reject).
+        Advisory, same contract as :meth:`set_assigned_worker`; records who
+        rendered the LATEST verdict (last-writer-wins across re-review rounds).
+        """
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE subtask_states SET assigned_reviewer = ?, updated_at = ? "
+                "WHERE task_id = ? AND subtask_id = ?",
+                (agent_id, _now_iso(), task_id, subtask_id),
+            )
+
     def record_merge_approval(
         self,
         subtask_id: str,
@@ -1135,4 +1181,5 @@ def _subtask_from_row(row: sqlite3.Row) -> SubtaskRow:
         merge_approved_by=row["merge_approved_by"],
         merge_approved_sha=row["merge_approved_sha"],
         merge_approval_requested_sha=row["merge_approval_requested_sha"],
+        assigned_reviewer=row["assigned_reviewer"],
     )

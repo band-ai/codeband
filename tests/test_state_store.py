@@ -648,3 +648,71 @@ def test_batch_latest_transitions_no_rows_returns_empty(store: StateStore) -> No
     result = store.batch_latest_transitions([("t-1", "st-a")])
     # No transition_log rows — subtask absent from result
     assert ("t-1", "st-a") not in result
+
+
+# ── item-0: assigned_reviewer column + identity setters ─────────────────────
+
+def test_assigned_reviewer_present_on_fresh_db(store: StateStore) -> None:
+    """A fresh schema includes assigned_reviewer, read back as NULL by default."""
+    store.create_task("t-1", "task", "room-1")
+    store.ensure_subtask("st-1", "t-1", state="in_progress")
+    sub = store.get_subtask("st-1", "t-1")
+    assert sub.assigned_reviewer is None
+
+
+def test_set_assigned_worker_and_reviewer_roundtrip(store: StateStore) -> None:
+    store.create_task("t-1", "task", "room-1")
+    store.ensure_subtask("st-1", "t-1", state="in_progress")
+    store.set_assigned_worker("st-1", "t-1", "agent-coder-7")
+    store.set_assigned_reviewer("st-1", "t-1", "agent-reviewer-3")
+    sub = store.get_subtask("st-1", "t-1")
+    assert sub.assigned_worker == "agent-coder-7"
+    assert sub.assigned_reviewer == "agent-reviewer-3"
+
+
+def test_assigned_reviewer_migrated_onto_legacy_subtask_table(tmp_path: Path) -> None:
+    """A pre-existing subtask_states without assigned_reviewer gains it.
+
+    Mirrors the merge-approval additive-migration: the guarded ALTER adds the
+    column, legacy rows read back NULL, and the new setter persists through the
+    migrated table. Re-opening the migrated DB is a no-op (idempotent).
+    """
+    db_path = tmp_path / "state" / "orchestration.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "task_id TEXT PRIMARY KEY, description TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'active')"
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, description, room_id, created_at, status) "
+        "VALUES ('old-1', 'legacy', 'old-1', '2020-01-01T00:00:00+00:00', 'active')"
+    )
+    conn.execute(
+        "CREATE TABLE subtask_states ("
+        "subtask_id TEXT NOT NULL, "
+        "task_id TEXT NOT NULL REFERENCES tasks(task_id), "
+        "state TEXT NOT NULL DEFAULT 'planned', assigned_worker TEXT, "
+        "pr_number INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+        "metadata TEXT, PRIMARY KEY (task_id, subtask_id))"
+    )
+    conn.execute(
+        "INSERT INTO subtask_states "
+        "(subtask_id, task_id, state, created_at, updated_at) "
+        "VALUES ('st-1', 'old-1', 'planned', "
+        "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db_path)  # runs the guarded migration
+
+    assert store.get_subtask("st-1", "old-1").assigned_reviewer is None  # legacy NULL
+    store.set_assigned_reviewer("st-1", "old-1", "agent-rev-9")
+    assert store.get_subtask("st-1", "old-1").assigned_reviewer == "agent-rev-9"
+
+    # Idempotent: re-opening the already-migrated DB does not error or wipe data.
+    store2 = StateStore(db_path)
+    assert store2.get_subtask("st-1", "old-1").assigned_reviewer == "agent-rev-9"

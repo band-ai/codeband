@@ -358,6 +358,40 @@ def resolve_project_dir(flag_value: str | Path = ".") -> Path:
     return Path(flag_value or ".").resolve()
 
 
+def _stamp_identity(store: StateStore, subtask_id: str, task_id: str, expected_role: str) -> None:
+    """Best-effort stamp of the caller's Band agent_id onto the subtask (item-0).
+
+    Resolves the invoking agent's identity (distributed env-first, else the
+    local worktree/scratch location map keyed on cwd — see
+    ``codeband/identity.py``) and writes it to ``assigned_worker`` (coder) or
+    ``assigned_reviewer`` (reviewer) ONLY when the resolved role matches
+    ``expected_role``. The role guard is what keeps a Conductor that ran
+    ``cb-phase start`` from being stamped as the worker, and is the local-mode
+    discriminator where the role gate does not apply.
+
+    Purely advisory: identity is never a gate. Any failure here — unresolvable
+    identity, wrong role, or a store error — is swallowed, because the FSM
+    transition this follows has already succeeded and must not be undone by a
+    forensic-field write.
+    """
+    try:
+        from codeband.identity import resolve_identity
+
+        state_dir = Path(store.db_path).parent
+        identity = resolve_identity(cwd=Path.cwd(), state_dir=state_dir)
+        if identity is None or identity.role != expected_role:
+            return
+        if expected_role == "coder":
+            store.set_assigned_worker(subtask_id, task_id, identity.agent_id)
+        elif expected_role == "reviewer":
+            store.set_assigned_reviewer(subtask_id, task_id, identity.agent_id)
+    except Exception:  # noqa: BLE001 - advisory stamp must never break the leg
+        logger.debug(
+            "Identity stamp skipped for subtask %s (advisory)", subtask_id,
+            exc_info=True,
+        )
+
+
 def _resolve_store(project_dir: Path) -> StateStore:
     """Build the StateStore from the project's codeband.yaml workspace path.
 
@@ -730,6 +764,11 @@ def _walk_to_in_progress(
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
         return current, 1
+    # item-0: stamp the coder's agent_id now that the assigned → in_progress
+    # edge actually fired (this code only runs on a real walk, not the
+    # already-underway no-op). Role-guarded so a Conductor that ran start is
+    # never recorded as the worker. Advisory — never blocks the transition.
+    _stamp_identity(store, subtask_id, task_id, "coder")
     return "in_progress", None
 
 
@@ -1281,6 +1320,11 @@ def _cmd_review(args: argparse.Namespace) -> int:
     except InvalidTransitionError as exc:
         print(f"cb-phase: review verdict rejected — {exc}", file=sys.stderr)
         return 1
+
+    # item-0: the verdict is the only place a reviewer is the actor, so stamp
+    # the reviewer's agent_id here (approve or reject). Role-guarded; advisory —
+    # the verdict above already recorded and must not be undone by this write.
+    _stamp_identity(store, args.subtask_id, task_id, "reviewer")
 
     print(
         f"cb-phase: subtask {args.subtask_id} → {new_state} (task {task_id})."
