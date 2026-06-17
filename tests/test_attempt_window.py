@@ -311,6 +311,41 @@ async def test_watchdog_direct_calls_isolated(activity):
     assert rows[0]["details"]["ack_422"] is False, "watchdog 422 contaminated a real marker"
 
 
+# --- 6b: original propagates (cancellation) → no marker, no registry pop ---
+
+
+async def test_propagated_exception_emits_nothing_and_preserves_open(activity):
+    import asyncio
+
+    logger, path = activity
+    aw.install_attempt_window_instrument(logger)
+    link, _ = _make_link(agent_id="agent-A")
+
+    # Seed a confirmed open for the key.
+    await link.mark_processing("room-1", "msg-cancel")
+    key = ("agent-A", "room-1", "msg-cancel")
+    assert key in aw._open_registry
+
+    # Make the captured SDK original PROPAGATE (cancellation), as the real SDK
+    # would on task teardown mid-ack. The wrapper resolves _orig_link_processed
+    # as a module global, so this swap is seen by the live wrapper.
+    async def _cancel(self, *a, **k):
+        raise asyncio.CancelledError()
+
+    aw._orig_link_processed = _cancel
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await link.mark_processed("room-1", "msg-cancel")
+    finally:
+        aw._orig_link_processed = _TRUE["link_processed"]
+
+    # The exact exception propagated; the open window survives (a retry needs
+    # it); no marker emitted; the contextvar is reset on the propagation path.
+    assert key in aw._open_registry, "propagated ack erased the open window"
+    assert _read_markers(path) == [], "propagated ack still emitted a marker"
+    assert aw._ack_slot.get() is None
+
+
 # --- 7: swallowed processing failure → elapsed None -----------------------
 
 
@@ -361,8 +396,8 @@ async def test_two_agents_same_room_message_isolated(activity, monkeypatch):
 
     await link_a.mark_processing("room-1", "shared-msg")  # t=10
     await link_b.mark_processing("room-1", "shared-msg")  # t=25
-    await link_a.mark_processed("room-1", "shared-msg")   # t=100 → 90.0
-    await link_b.mark_processed("room-1", "shared-msg")   # t=130 → 105.0
+    await link_a.mark_processed("room-1", "shared-msg")  # t=100 → 90.0
+    await link_b.mark_processed("room-1", "shared-msg")  # t=130 → 105.0
 
     rows = _read_markers(path)
     by_agent = {r["details"]["agent_id"]: r["details"]["elapsed_seconds"] for r in rows}

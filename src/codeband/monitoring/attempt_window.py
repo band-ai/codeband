@@ -158,14 +158,18 @@ def install_attempt_window_instrument(activity: "ActivityLogger") -> None:
         slot = {"opened": False}
         token = _open_slot.set(slot)
         try:
-            return await _orig_link_processing(self, room_id, message_id, *args, **kwargs)
+            result = await _orig_link_processing(self, room_id, message_id, *args, **kwargs)
         finally:
             _open_slot.reset(token)
-            if slot["opened"]:
-                try:
-                    _record_open(getattr(self, "agent_id", None), room_id, message_id)
-                except Exception:  # noqa: BLE001 - observation must never perturb the ack path
-                    logger.debug("attempt-window: open record failed", exc_info=True)
+        # Reached only on a NORMAL return of the SDK original. If the original
+        # propagated (e.g. cancellation), we never record an open — there is no
+        # completed attempt to time.
+        if slot["opened"]:
+            try:
+                _record_open(getattr(self, "agent_id", None), room_id, message_id)
+            except Exception:  # noqa: BLE001 - observation must never perturb the ack path
+                logger.debug("attempt-window: open record failed", exc_info=True)
+        return result
 
     @wraps(_orig_rest_processing)
     async def _wrapped_rest_processing(self, *args, **kwargs):
@@ -199,13 +203,18 @@ def install_attempt_window_instrument(activity: "ActivityLogger") -> None:
         slot = {"http_422": False}
         token = _ack_slot.set(slot)
         try:
-            return await _orig_link_processed(self, room_id, message_id, *args, **kwargs)
+            result = await _orig_link_processed(self, room_id, message_id, *args, **kwargs)
         finally:
             _ack_slot.reset(token)
-            try:
-                _emit(self, room_id, message_id, t_ack, slot["http_422"])
-            except Exception:  # noqa: BLE001 - emission must never perturb the ack path
-                logger.debug("attempt-window: emit failed", exc_info=True)
+        # Emit ONLY on a normal return of the SDK original — i.e. a completed
+        # (and possibly 422-swallowed) ack. If the original propagated (e.g.
+        # cancellation), we re-raise the identical exception WITHOUT emitting a
+        # marker or popping the open entry, so a later retry still has its window.
+        try:
+            _emit(self, room_id, message_id, t_ack, slot["http_422"])
+        except Exception:  # noqa: BLE001 - emission must never perturb the ack path
+            logger.debug("attempt-window: emit failed", exc_info=True)
+        return result
 
     for fn in (
         _wrapped_link_processing,
