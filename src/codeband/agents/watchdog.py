@@ -2309,7 +2309,10 @@ class WatchdogDaemon:
 
         Per-agent REST clients are required because both the probes and the
         heals act on the calling agent's own delivery row — the Conductor's
-        credentials only see/heal the Conductor's deliveries. When
+        credentials only see/heal the Conductor's deliveries. The watchdog
+        runs on the Conductor's credential; its entry in ``agent_rest_clients``
+        is swept like any other agent so the Conductor's own pinned cursor is
+        healed (the threshold guard keeps live turns untouched). When
         ``agent_rest_clients`` is empty (or the kill switch is off), the rung
         is a no-op and the existing nudge / escalation paths are unaffected.
         """
@@ -2323,11 +2326,6 @@ class WatchdogDaemon:
             r.id for r in rooms if getattr(r, "id", None) not in inactive_rooms
         ]
         for agent_id, client in self._agent_rest_clients.items():
-            if agent_id == self._agent_id:
-                # The watchdog already runs with this client's credentials via
-                # ``self._rest``; skipping prevents a redundant double-check
-                # on the same delivery rows.
-                continue
             for room_id in room_ids:
                 await self._check_one_agent_room_pins(
                     agent_id, room_id, client, threshold, now,

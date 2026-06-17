@@ -299,14 +299,14 @@ async def test_existing_nudge_path_unaffected_when_no_pins(watchdog_config):
 
 
 @pytest.mark.asyncio
-async def test_skip_self_agent_id(watchdog_config):
-    """The watchdog's own (Conductor) id is skipped — its credentials are
-    already used by `self._rest` and probing the same row via two clients is
-    redundant."""
+async def test_conductor_own_pinned_cursor_is_healed(watchdog_config):
+    """The watchdog's own (Conductor) credential entry in agent_rest_clients is
+    now swept by the heal loop — the Conductor is the most common 422-pin victim
+    and must not be excluded from the rung that heals pins."""
     now = datetime.now(UTC)
-    stuck = _make_message("msg-pinned", now - timedelta(seconds=900))
+    stuck = _make_message("msg-pinned", now - timedelta(seconds=900))  # > T (600)
     conductor_rest = _make_conductor_rest_client()
-    # Map an entry under the conductor's own id — must be skipped.
+    # Entry under the conductor's own id — must be healed, not skipped.
     own_client = _make_agent_rest_client([stuck])
     daemon = _make_daemon(
         watchdog_config, conductor_rest, {"agent-cond": own_client},
@@ -314,8 +314,30 @@ async def test_skip_self_agent_id(watchdog_config):
 
     await daemon._patrol()
 
-    own_client.agent_api_messages.list_agent_messages.assert_not_called()
+    own_client.agent_api_messages.list_agent_messages.assert_any_await(
+        chat_id="room-1", status="processing", page_size=100,
+    )
+    own_client.agent_api_messages.mark_agent_message_processed.assert_awaited_once_with(
+        chat_id="room-1", id="msg-pinned",
+    )
+
+
+@pytest.mark.asyncio
+async def test_conductor_own_fresh_delivery_not_healed(watchdog_config):
+    """The Conductor's own delivery younger than T is left alone — the threshold
+    guard (not the removed agent-id skip) protects live turns."""
+    now = datetime.now(UTC)
+    fresh = _make_message("msg-fresh", now - timedelta(seconds=60))  # < T (600)
+    conductor_rest = _make_conductor_rest_client()
+    own_client = _make_agent_rest_client([fresh])
+    daemon = _make_daemon(
+        watchdog_config, conductor_rest, {"agent-cond": own_client},
+    )
+
+    await daemon._patrol()
+
     own_client.agent_api_messages.mark_agent_message_processed.assert_not_called()
+    own_client.agent_api_messages.mark_agent_message_processing.assert_not_called()
 
 
 @pytest.mark.asyncio
