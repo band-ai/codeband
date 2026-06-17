@@ -220,3 +220,4 @@ __marimo__/
 
 # Codeband — agent credentials (contains API keys)
 agent_config.yaml
+AGENTS.md
