@@ -1052,3 +1052,63 @@ def test_guard_regression_valid_id_proceeds_through_start(tmp_path, monkeypatch)
 
     assert handoff.main(["start", "st-1", "--project-dir", str(project_dir)]) == 0
     assert store.get_subtask("st-1", "room-1").state == "in_progress"
+
+
+# ── item-0: identity stamping at start (worker) and review (reviewer) ────────
+
+def test_start_stamps_assigned_worker_with_coder_identity(monkeypatch, tmp_path):
+    """A coder running ``cb-phase start`` stamps its agent_id onto the subtask."""
+    s = StateStore(tmp_path / "state" / "orchestration.db")
+    s.create_task(task_id="room-1", description="demo", room_id="room-1")
+    transition("st-1", "room-1", "assigned", caller_role="conductor", store=s)
+    # Distributed-mode env identity (env-first path of resolve_identity).
+    monkeypatch.setenv("CODEBAND_AGENT_ID", "agent-coder-1")
+    monkeypatch.setenv("CODEBAND_ROLE", "coder")
+    assert _start(s, monkeypatch, "st-1") == 0
+    sub = s.get_subtask("st-1", "room-1")
+    assert sub.state == "in_progress"
+    # The watchdog reads assigned_worker as a mention id — now a real value.
+    assert sub.assigned_worker == "agent-coder-1"
+
+
+def test_start_by_non_coder_role_does_not_stamp_worker(monkeypatch, tmp_path):
+    """The Conductor may also run start; its identity must NOT become the worker."""
+    s = StateStore(tmp_path / "state" / "orchestration.db")
+    s.create_task(task_id="room-1", description="demo", room_id="room-1")
+    transition("st-1", "room-1", "assigned", caller_role="conductor", store=s)
+    monkeypatch.setenv("CODEBAND_AGENT_ID", "agent-conductor")
+    monkeypatch.setenv("CODEBAND_ROLE", "conductor")  # allowed for start, but not a coder
+    assert _start(s, monkeypatch, "st-1") == 0
+    sub = s.get_subtask("st-1", "room-1")
+    assert sub.state == "in_progress"
+    assert sub.assigned_worker is None  # role guard left it unstamped
+
+
+def test_review_stamps_assigned_reviewer_with_reviewer_identity(store, monkeypatch):
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    monkeypatch.setenv("CODEBAND_AGENT_ID", "agent-reviewer-2")
+    monkeypatch.setenv("CODEBAND_ROLE", "reviewer")
+    assert _review(monkeypatch, store, "--approve") == 0
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "review_passed"
+    assert sub.assigned_reviewer == "agent-reviewer-2"
+
+
+def test_review_reject_also_stamps_assigned_reviewer(store, monkeypatch):
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    monkeypatch.setenv("CODEBAND_AGENT_ID", "agent-reviewer-2")
+    monkeypatch.setenv("CODEBAND_ROLE", "reviewer")
+    assert _review(monkeypatch, store, "--reject") == 0
+    assert store.get_subtask("st-1", "room-1").assigned_reviewer == "agent-reviewer-2"
+
+
+def test_review_unresolvable_identity_records_verdict_without_stamp(store, monkeypatch):
+    """No env identity + no location map → assigned_reviewer NULL, but the FSM
+    verdict still records (the advisory stamp never blocks the transition)."""
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    monkeypatch.delenv("CODEBAND_AGENT_ID", raising=False)
+    monkeypatch.delenv("CODEBAND_ROLE", raising=False)
+    assert _review(monkeypatch, store, "--approve") == 0
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "review_passed"  # verdict recorded
+    assert sub.assigned_reviewer is None  # nothing to stamp

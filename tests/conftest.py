@@ -32,6 +32,10 @@ _CONTAMINATING_VARS = (
     "CODEBAND_FALLBACK_ANTHROPIC_API_KEY",
     "CODEBAND_FALLBACK_OPENAI_API_KEY",
     "CODEBAND_AGENT_SESSION",
+    # item-0: identity env var — scrub so dir→identity resolution tests are
+    # deterministic across developer shells / CI (a stale value would make
+    # env-first resolution win when a test expects the local map path).
+    "CODEBAND_AGENT_ID",
 )
 
 
