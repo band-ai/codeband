@@ -16,8 +16,17 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from codeband.models import CLAUDE_OPUS, CLAUDE_SONNET
+
 if TYPE_CHECKING:
     from codeband.config import CodebandConfig
+
+# A worker pool whose entry omits `model` falls back to a default at spawn time.
+# That default is Sonnet for every role except coders (Opus) — mirror the
+# spawner here (runner.py: reviewers/plan_reviewers `or CLAUDE_SONNET`, coders
+# via ClaudePlayerRunner's Opus default). Only the non-Sonnet exception needs an
+# entry; everything else — including any pool added later — defaults to Sonnet.
+_POOL_MODEL_DEFAULT: dict[str, str] = {"coders": CLAUDE_OPUS}
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +51,31 @@ class PreflightError:
 # Keep phrases short and specific so one real provider error string matches
 # exactly one pattern.
 _CLAUDE_ERROR_PATTERNS: list[tuple[str, str]] = [
+    (
+        # A 400 the API returns when the request carries an outdated extended-
+        # thinking shape (legacy `thinking.type.enabled`). The usual cause is a
+        # stale Claude Code CLI bundled inside an old `claude-agent-sdk`. band's
+        # adapter swallows this error and emits nothing, so the agent connects
+        # but silently does no work — keep this pattern ahead of the generic
+        # `invalid_request_error` so the remediation is specific.
+        "is not supported for this model",
+        (
+            "A configured Claude model rejected the request shape. This is almost "
+            "always a stale Claude Code CLI bundled inside `claude-agent-sdk` sending "
+            "the legacy `thinking.type.enabled` shape that current models reject. "
+            "Run `pip install -U claude-agent-sdk`, or pin a model that accepts it in "
+            "codeband.yaml. (`cb doctor` reports the bundled CLI version.)"
+        ),
+    ),
+    (
+        "invalid_request_error",
+        (
+            "Anthropic rejected the request as invalid — often a stale Claude Code "
+            "CLI bundled inside `claude-agent-sdk` sending an outdated request shape. "
+            "Run `pip install -U claude-agent-sdk`, or check the configured model in "
+            "codeband.yaml."
+        ),
+    ),
     (
         "credit balance is too low",
         (
@@ -270,12 +304,17 @@ def _restore_openai_api_key_fallback() -> bool:
     return True
 
 
-async def check_claude_auth(auth_mode: str = "api_key") -> PreflightError | None:
+async def check_claude_auth(
+    auth_mode: str = "api_key", model: str = CLAUDE_SONNET
+) -> PreflightError | None:
     """Send one tiny Claude SDK call to verify auth works end-to-end.
 
     Returns ``None`` on success; a ``PreflightError`` describing the
     failure otherwise. The probe uses ``utility_llm.one_shot_text`` so it
-    exercises the exact same auth path as every coding agent.
+    exercises the exact same auth path as every coding agent — including the
+    ``model``, so a model that rejects the request shape (e.g. a stale bundled
+    CLI sending legacy ``thinking.type.enabled``) is caught before agents spawn
+    rather than silently swallowed at runtime.
 
     In the default ``api_key`` mode, an absent ``ANTHROPIC_API_KEY`` is a
     fast, classified failure (no API call): subscription OAuth is never used
@@ -299,7 +338,7 @@ async def check_claude_auth(auth_mode: str = "api_key") -> PreflightError | None
     from codeband.utility_llm import one_shot_text
 
     try:
-        result = await one_shot_text("Reply with just: ok")
+        result = await one_shot_text("Reply with just: ok", model=model)
     except Exception as exc:
         # Usage-limit, auth, and rate-limit failures surface here too: the
         # CLI exits non-zero and ``one_shot_text`` re-raises with stderr
@@ -309,16 +348,16 @@ async def check_claude_auth(auth_mode: str = "api_key") -> PreflightError | None
         message = f"{type(exc).__name__}: {exc}"
         haystack = message.lower()
         if _is_claude_usage_limit(haystack) and _restore_anthropic_api_key_fallback():
-            return await check_claude_auth(auth_mode)
+            return await check_claude_auth(auth_mode, model)
         for pattern, remediation in _CLAUDE_ERROR_PATTERNS:
             if pattern in haystack:
                 return PreflightError(
-                    summary=f"Claude auth check failed: {exc}",
+                    summary=f"Claude auth check failed (model={model}): {exc}",
                     remediation=remediation,
                     classified=True,
                 )
         return PreflightError(
-            summary=f"Claude SDK call raised {message}",
+            summary=f"Claude SDK call raised (model={model}) {message}",
             remediation=(
                 "Check Claude CLI auth (ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, "
                 "or macOS keychain via `claude` login) and network connectivity."
@@ -328,11 +367,11 @@ async def check_claude_auth(auth_mode: str = "api_key") -> PreflightError | None
 
     haystack = result.lower()
     if _is_claude_usage_limit(haystack) and _restore_anthropic_api_key_fallback():
-        return await check_claude_auth(auth_mode)
+        return await check_claude_auth(auth_mode, model)
     for pattern, remediation in _CLAUDE_ERROR_PATTERNS:
         if pattern in haystack:
             return PreflightError(
-                summary=f"Claude auth check failed: {result.strip()}",
+                summary=f"Claude auth check failed (model={model}): {result.strip()}",
                 remediation=remediation,
                 classified=True,
             )
@@ -383,19 +422,66 @@ def _config_uses_codex(config: CodebandConfig) -> bool:
     )
 
 
+def _claude_models(config: CodebandConfig) -> list[str]:
+    """Distinct Claude models actually configured across *all* roles, order-preserving.
+
+    Discovered generically from the ``AgentsConfig`` fields so new singleton agents
+    or worker pools are probed automatically — there is no role list to keep in sync.
+    Two shapes are recognized (the same ones the rest of the code duck-types):
+
+    * singleton agents expose ``.framework`` + ``.model`` (Conductor, Mergemaster);
+    * worker pools expose ``.entry_for(framework)`` (planners/coders/reviewers/...).
+
+    A pool entry with ``model=None`` falls back to the same default the spawner uses
+    (Opus for coders, Sonnet elsewhere — see ``_POOL_MODEL_DEFAULT``). Each model is
+    probed by ``run_preflight`` so one that rejects the request shape (e.g. a stale
+    bundled CLI sending legacy ``thinking.type.enabled``) fails fast instead of
+    producing a silent, do-nothing agent at runtime.
+    """
+    from codeband.config import Framework
+
+    agents = config.agents
+    models: list[str] = []
+    for field_name in type(agents).model_fields:
+        value = getattr(agents, field_name)
+        if hasattr(value, "framework") and hasattr(value, "model"):
+            # Singleton agent.
+            if value.framework == Framework.CLAUDE_SDK and value.model:
+                models.append(value.model)
+        elif hasattr(value, "entry_for"):
+            # Worker pool.
+            entry = value.entry_for(Framework.CLAUDE_SDK)
+            if entry.count > 0:
+                models.append(
+                    entry.model or _POOL_MODEL_DEFAULT.get(field_name, CLAUDE_SONNET)
+                )
+
+    seen: set[str] = set()
+    distinct: list[str] = []
+    for model in models:
+        if model and model not in seen:
+            seen.add(model)
+            distinct.append(model)
+    return distinct
+
+
 async def run_preflight(config: CodebandConfig) -> PreflightError | None:
     """Run all applicable auth preflight checks concurrently.
 
-    Claude is always checked. Codex is checked only when at least one
-    Codex-framework agent is configured. Both checks are independent CLI
-    cold-starts (~2–5s each) so we run them via :func:`asyncio.gather`
-    and return the first error encountered. Claude wins ties — its check
-    is fed to ``gather`` first, so a Claude error appears at index 0 and
-    is preferred over a coincident Codex error.
+    Every distinct Claude model in the config is probed (not just a default),
+    so a model that rejects the request shape is caught before agents spawn.
+    Codex is checked only when at least one Codex-framework agent is configured.
+    The checks are independent CLI cold-starts (~2–5s each) so we run them via
+    :func:`asyncio.gather` and return the first error encountered. Claude wins
+    ties — its checks are fed to ``gather`` first, so a Claude error is preferred
+    over a coincident Codex error.
     """
     import asyncio
 
-    tasks = [check_claude_auth(config.claude.auth_mode)]
+    tasks = [
+        check_claude_auth(config.claude.auth_mode, model)
+        for model in _claude_models(config)
+    ]
     if _config_uses_codex(config):
         tasks.append(check_codex_auth())
 
