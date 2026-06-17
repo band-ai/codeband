@@ -439,6 +439,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
 -- migration path for pre-index DBs.
 CREATE INDEX IF NOT EXISTS idx_transition_log_task_subtask
     ON transition_log(task_id, subtask_id);
+
+-- Durable per-agent processed-message record for the jam delivery path.
+-- Keyed by (scope, message_id) so distinct agents never collide and the same
+-- agent cannot false-skip a legitimately different message. Written immediately
+-- after ``adapter.on_event`` completes (before the ack), so a failed ack
+-- followed by a JamAgent restart finds the record and skips re-delivery.
+-- ``CREATE TABLE IF NOT EXISTS`` is idempotent on existing DBs — no ALTER TABLE
+-- migration is needed. Not hash-chained (advisory record, not an FSM effect).
+CREATE TABLE IF NOT EXISTS jam_processed_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope      TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    handled_at TEXT NOT NULL,
+    UNIQUE(scope, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_jam_processed_lookup
+    ON jam_processed_messages(scope, message_id);
 """
 
 
@@ -1143,6 +1160,39 @@ class StateStore:
             except (ValueError, TypeError):
                 result[key] = None
         return result
+
+    # ── jam durable processed-message dedupe ──────────────────────────────────
+
+    def mark_jam_message_handled(self, scope: str, message_id: str) -> None:
+        """Record that a jam inbound message was successfully handled.
+
+        Written immediately after ``adapter.on_event`` completes and BEFORE the
+        ack, so a failed ack followed by a ``JamAgent`` restart finds this record
+        and skips re-delivery.  ``INSERT OR IGNORE`` makes it idempotent — a
+        duplicate call (e.g. a same-process re-delivery race) is a no-op.
+        """
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO jam_processed_messages "
+                "(scope, message_id, handled_at) VALUES (?, ?, ?)",
+                (scope, message_id, _now_iso()),
+            )
+
+    def is_jam_message_handled(self, scope: str, message_id: str) -> bool:
+        """Return True if a durable handled record exists for this (scope, message_id).
+
+        Used by ``JamAgent._RoomWorker._process`` before invoking the handler on
+        a re-queued message (failed-ack + restart).  Returns False on any DB
+        error — the caller wraps this in its own try/except and fails-open so a
+        transient outage never blocks delivery.
+        """
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM jam_processed_messages "
+                "WHERE scope = ? AND message_id = ?)",
+                (scope, message_id),
+            ).fetchone()
+        return bool(row[0]) if row is not None else False
 
 
 def _task_from_row(row: sqlite3.Row) -> TaskRow:

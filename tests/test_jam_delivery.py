@@ -473,3 +473,166 @@ def test_doctor_jam_coupling_fails_when_jam_selected(tmp_path, monkeypatch):
     res = check_jam_delivery_sdk_coupling(_doctor_ctx(tmp_path))
     assert res.status is Status.FAIL
     assert res.remediation and "jam_runtime.py" in res.remediation
+
+
+# --- durable dedupe -----------------------------------------------------------
+
+
+def _make_store(tmp_path):
+    from codeband.state.store import StateStore
+
+    return StateStore(tmp_path / "test_dedupe.db")
+
+
+def _make_agent_with_store(store, *, agent_id="agent-A", max_retries=3):
+    agent, adapter, control = _make_agent(agent_id=agent_id, max_retries=max_retries)
+    agent._store = store
+    return agent, adapter, control
+
+
+async def test_durable_dedupe_write_after_handler_success(tmp_path):
+    """Successful handler writes the durable record before the ack."""
+    store = _make_store(tmp_path)
+    agent, adapter, control = _make_agent_with_store(store)
+    worker = _make_worker(agent)
+
+    scope = agent._target.scope
+    await worker._process(_wire_msg("m1"))
+
+    assert len(adapter.events) == 1
+    assert control.acked == ["m1"]
+    assert store.is_jam_message_handled(scope, "m1") is True
+
+
+async def test_durable_dedupe_restart_skips_redelivery(tmp_path):
+    """A fresh JamAgent with empty _handled skips a message already durable-handled."""
+    store = _make_store(tmp_path)
+
+    # First agent: process and (fail) the ack so the message stays queued.
+    control_a = FakeControl(ack_ok=False)  # ack rejected
+    agent_a, adapter_a, _ = _make_agent_with_store(store, agent_id="agent-A")
+    agent_a._control = control_a
+    worker_a = _make_worker(agent_a)
+    await worker_a._process(_wire_msg("m-restart"))
+
+    assert len(adapter_a.events) == 1  # handler ran
+    scope = agent_a._target.scope
+    assert store.is_jam_message_handled(scope, "m-restart") is True  # durable record written
+
+    # Second agent: same scope (same agent_id → same scope), fresh in-memory state.
+    agent_b, adapter_b, control_b = _make_agent_with_store(store, agent_id="agent-A")
+    assert "m-restart" not in agent_b._handled  # empty in-memory set
+    worker_b = _make_worker(agent_b)
+    await worker_b._process(_wire_msg("m-restart"))
+
+    assert adapter_b.events == []  # handler NOT called on second agent
+    assert control_b.acked == ["m-restart"]  # ack-to-drain called
+
+
+async def test_durable_dedupe_no_false_skip_on_handler_failure(tmp_path):
+    """A handler that raises must NOT write the durable record (no false-skip)."""
+    store = _make_store(tmp_path)
+
+    async def on_event_boom(inp):
+        raise RuntimeError("handler failed")
+
+    adapter = FakeAdapter(on_event=on_event_boom)
+    agent, _, _ = _make_agent_with_store(store, agent_id="agent-A")
+    agent._adapter = adapter
+    worker = _make_worker(agent)
+
+    with pytest.raises(RuntimeError):
+        await worker._process(_wire_msg("m-fail"))
+
+    scope = agent._target.scope
+    assert store.is_jam_message_handled(scope, "m-fail") is False  # no false-skip
+
+
+async def test_durable_dedupe_migration_idempotent(tmp_path):
+    """Opening the same StateStore twice creates the table exactly once (idempotent)."""
+    from codeband.state.store import StateStore
+
+    store1 = StateStore(tmp_path / "idem.db")
+    store2 = StateStore(tmp_path / "idem.db")  # second open, same file
+    store1.mark_jam_message_handled("scope-A", "msg-1")
+    assert store2.is_jam_message_handled("scope-A", "msg-1") is True
+
+    # Idempotent: writing the same record again is a no-op (INSERT OR IGNORE).
+    store1.mark_jam_message_handled("scope-A", "msg-1")
+    assert store2.is_jam_message_handled("scope-A", "msg-1") is True
+
+
+async def test_durable_check_read_failure_fails_open(tmp_path, monkeypatch):
+    """A DB read failure in the durable-check falls open: handler still runs."""
+    store = _make_store(tmp_path)
+
+    from codeband.state.store import StateStore
+
+    def _boom(*a, **k):
+        raise Exception("simulated DB read error")
+
+    monkeypatch.setattr(StateStore, "is_jam_message_handled", _boom)
+    agent, adapter, control = _make_agent_with_store(store)
+    worker = _make_worker(agent)
+
+    await worker._process(_wire_msg("m-read-fail"))
+
+    assert len(adapter.events) == 1  # handler ran (fail-open)
+    assert control.acked == ["m-read-fail"]
+
+
+async def test_durable_dedupe_scope_isolation(tmp_path):
+    """Two agents with different scopes (different agent_ids) never false-skip each other."""
+    store = _make_store(tmp_path)
+
+    agent_x, adapter_x, _ = _make_agent_with_store(store, agent_id="agent-X")
+    agent_y, adapter_y, _ = _make_agent_with_store(store, agent_id="agent-Y")
+
+    # Agent-X handles "shared-msg".
+    worker_x = _make_worker(agent_x)
+    await worker_x._process(_wire_msg("shared-msg"))
+    assert store.is_jam_message_handled(agent_x._target.scope, "shared-msg") is True
+
+    # Agent-Y has a different scope — should NOT be skipped.
+    worker_y = _make_worker(agent_y)
+    await worker_y._process(_wire_msg("shared-msg"))
+    assert len(adapter_y.events) == 1  # handler ran on agent-Y too
+
+
+async def test_durable_dedupe_production_lazy_build(tmp_path):
+    """Production lazy-build: a non-injected JamAgent constructs a usable StateStore."""
+    # Build a config with a real resolved workspace path pointing to tmp_path.
+    workspace_path = tmp_path / ".codeband"
+    workspace_path.mkdir()
+    config = SimpleNamespace(
+        agents=SimpleNamespace(idle_resync_seconds=1, max_message_retries=3, delivery="jam"),
+        band=SimpleNamespace(ws_url="ws://test", rest_url="http://test"),
+        workspace=SimpleNamespace(path=str(workspace_path)),
+    )
+    from thenvoi.preprocessing.default import DefaultPreprocessor
+    from thenvoi.runtime.types import SessionConfig
+
+    adapter = FakeAdapter()
+    control = FakeControl()
+    # No store= injected — triggers the lazy-build path in start().
+    agent = JamAgent(
+        adapter,
+        _creds("agent-lazy"),
+        config,
+        control=control,
+        link=SimpleNamespace(rest=SimpleNamespace()),
+        preprocessor=DefaultPreprocessor(),
+    )
+    agent._session_config = SessionConfig(
+        enable_context_hydration=False,
+        max_message_retries=3,
+        idle_resync_seconds=1,
+    )
+    # start() builds the store lazily.
+    await agent.start()
+
+    assert agent._store is not None
+    scope = agent._target.scope
+    # Write and read round-trip.
+    agent._store.mark_jam_message_handled(scope, "lazy-msg")
+    assert agent._store.is_jam_message_handled(scope, "lazy-msg") is True

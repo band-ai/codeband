@@ -68,6 +68,7 @@ import logging
 import os
 from collections import OrderedDict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from codeband.transport.jam_control import (
@@ -137,6 +138,7 @@ class JamAgent:
         control: JamControlClient | None = None,
         link: Any = None,
         preprocessor: Any = None,
+        store: Any = None,
     ):
         self._adapter = adapter
         self._agent_id = creds.agent_id
@@ -146,6 +148,7 @@ class JamAgent:
         self._control = control
         self._link = link
         self._preprocessor = preprocessor
+        self._store = store  # durable dedupe store; built lazily in start() if None
         self._session_config: Any = None
         self._target = Target(scope=agent_scope(self._agent_id))
         self._poll_interval = float(config.agents.idle_resync_seconds)
@@ -183,6 +186,19 @@ class JamAgent:
                 idle_resync_seconds=self._config.agents.idle_resync_seconds,
                 max_message_retries=self._config.agents.max_message_retries,
             )
+        if self._store is None:
+            try:
+                from codeband.state import StateStore
+
+                self._store = StateStore(
+                    Path(self._config.workspace.path) / "state" / "orchestration.db"
+                )
+            except Exception:
+                logger.warning(
+                    "JamAgent: StateStore unavailable at %s — durable dedupe disabled",
+                    getattr(getattr(self._config, "workspace", None), "path", "?"),
+                )
+                self._store = None
 
         await self._adopt()
         if not await self._control.ping():
@@ -428,6 +444,27 @@ class _RoomWorker:
             await agent._ack_drain(msg_id, reason="self")
             return
 
+        # Durable restart-surviving dedupe: a fresh JamAgent after a failed ack
+        # skips messages whose handler already completed in a prior process.
+        # Checked before record_attempt so a skip doesn't consume a retry slot.
+        # Fail-open on DB error: log and proceed as unhandled (in-memory-only
+        # dedupe still active; anti-wedge property preserved).
+        if agent._store is not None:
+            try:
+                if agent._store.is_jam_message_handled(agent._target.scope, msg_id):
+                    logger.info(
+                        "jam durable-dedupe skip: %s already handled (scope=%s)",
+                        msg_id,
+                        agent._target.scope,
+                    )
+                    await agent._ack_drain(msg_id, reason="durable_handled")
+                    return
+            except Exception:
+                logger.warning(
+                    "jam: durable-check read failed for %s — proceeding as unhandled",
+                    msg_id,
+                )
+
         # Permanently-failed skip (the SDK checks this first too).
         if self._retry.is_permanently_failed(msg_id):
             await agent._ack_drain(msg_id, reason="permanently_failed")
@@ -457,6 +494,16 @@ class _RoomWorker:
             return
 
         await agent._adapter.on_event(inp)
+
+        # Write the durable processed-message record BEFORE the ack.  If the ack
+        # fails and the agent restarts, the fresh JamAgent reads this and skips
+        # re-delivery.  Non-fatal: a write failure (rare) degrades to in-memory-
+        # only dedupe for this message but does not block other messages.
+        if agent._store is not None:
+            try:
+                agent._store.mark_jam_message_handled(agent._target.scope, msg_id)
+            except Exception:
+                logger.warning("jam: durable-handled write failed for %s (in-memory only)", msg_id)
 
         # Success → clear retry tracking, mark handled, ack (non-fatal).
         self._retry.mark_success(msg_id)
