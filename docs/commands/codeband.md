@@ -11,8 +11,8 @@ $ARGUMENTS
 
 ## How this works (the architecture — don't deviate)
 
-- A single shared **codeband home** (`~/projects/codeband`) holds the keys (`.env`) and the 8 registered Band agents (`agent_config.yaml`). It gets re-pointed at the current repo each run. Only ONE codeband runs at a time; switching repos wipes the prior workspace.
-- **You** (`jam`) come online as your own ephemeral Band agent (`yoni/claude-<repo>-<hex>`). **You create the task room with your OWN agent key** and add the 8 codeband agents to it. You are `task.owner`, so the Conductor reports back to you by @mentioning you.
+- A single shared **codeband home** (`~/projects/codeband`) holds the keys (`.env`) and the 10 registered Band agents (`agent_config.yaml`). It gets re-pointed at the current repo each run. Only ONE codeband runs at a time; switching repos wipes the prior workspace.
+- **You** (`jam`) come online as your own ephemeral Band agent (`yoni/claude-<repo>-<hex>`). **You create the task room with your OWN agent key** and add the 10 codeband agents to it. You are `task.owner`, so the Conductor reports back to you by @mentioning you.
 - Delivery: the room Monitor reads the **authoritative full room** via `cb room-log` and auto-wakes you for each new Band message. Do not use the jam bridge's `team-lead.json` inbox slice for delivery; it is not the source of truth for this owner-coordinator loop.
 - You post to the room with `jam send`, relay concise summaries to the user, and handle approvals as the sole coordinator.
 
@@ -46,7 +46,7 @@ fi
      - `BAND_API_KEY` — their Band **user** key (`band_u_…`, from https://app.band.ai)
      - `ANTHROPIC_API_KEY`
      - `OPENAI_API_KEY`
-  3. Run the idempotent bootstrap, passing the keys via env (it installs uv/gh/codex/jam/codeband as needed, configures the jam profile, creates the codeband home, writes `.env`, and registers the 8 Band agents):
+  3. Run the idempotent bootstrap, passing the keys via env (it installs uv/gh/codex/jam/codeband as needed, configures the jam profile, creates the codeband home, writes `.env`, and registers the 10 Band agents):
      ```bash
      BAND_API_KEY="<band_u_…>" ANTHROPIC_API_KEY="<sk-ant-…>" OPENAI_API_KEY="<sk-…>" \
        bash "$HOME/.claude/codeband/setup.sh"

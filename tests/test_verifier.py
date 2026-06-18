@@ -269,7 +269,7 @@ class TestAcquireVerifierFor:
         assert wid.framework == Framework.CLAUDE_SDK
 
     def test_returns_none_when_no_verifiers_registered(self):
-        """Returns None when the verifier seat is INERT (count=0)."""
+        """Returns None when the verifier pool is explicitly opted out."""
         pool = WorkerPool()
         assert pool.acquire_verifier_for(Framework.CLAUDE_SDK) is None
         assert pool.acquire_verifier_for(Framework.CODEX) is None
@@ -425,7 +425,7 @@ class TestDoctorVerifierPairing:
         assert check_verifier_pairing in fns
 
 
-# ─── verify_acceptance verdict coupling (leg wired, INERT default) ────────────
+# ─── verify_acceptance verdict coupling (leg wired, active default) ───────────
 
 class TestVerifierVerdictCoupling:
     def test_known_verdicts_includes_verify_acceptance(self):
@@ -438,10 +438,11 @@ class TestVerifierVerdictCoupling:
     def test_default_required_verdicts_add_acceptance_when_verifier_configured(self):
         """Resolved verdicts add verify_acceptance iff a verifier is configured.
 
-        The seat is INERT by default, so the gate is exercised by configuring a
-        verifier explicitly here. resolve_required_verdicts enforces that
-        handoff_verify_command is set when 'verify' is in the list, so we supply
-        one to isolate the verdict content check from the precondition check.
+        This test pins the verifier pool explicitly so it exercises the
+        iff-configured coupling independent of future default-shape changes.
+        resolve_required_verdicts enforces that handoff_verify_command is set
+        when 'verify' is in the list, so we supply one to isolate the verdict
+        content check from the precondition check.
         """
         from codeband.state.registration import resolve_required_verdicts
         agents = AgentsConfig(

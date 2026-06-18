@@ -134,8 +134,9 @@ _POOL_ROLES: tuple[tuple[WorkerRole, str, str], ...] = (
             "Codeband Verifier — checks evidence integrity for completed "
             "subtasks before merge. Cross-model: verifies evidence from "
             "Coders on the opposite framework. Posts a PASS/FAIL verdict "
-            "consumed by the merge gate. Seat is INERT (count=0) until "
-            "the verdict leg is wired. Discovery: role=verification_agent"
+            "consumed by the merge gate. Active by default when configured; "
+            "set both verifier counts to 0 to opt out. Discovery: "
+            "role=verification_agent"
         ),
     ),
 )

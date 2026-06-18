@@ -1,59 +1,123 @@
 # Configuration
 
-`cb init --repo <url>` writes a default `codeband.yaml` designed for the free-tier Band.ai 10-agent cap. The default uses eight Band.ai agents plus one in-process Watchdog.
+`cb init --repo <url>` writes a default `codeband.yaml` designed for the free-tier Band.ai 10-agent cap. The default uses ten Band.ai agents plus one in-process Watchdog.
 
 ## Default `codeband.yaml`
 
 ```yaml
 repo:
-  url: "https://github.com/myorg/myrepo.git"
-  branch: "main"
-
+  url: https://github.com/myorg/myrepo.git
+  branch: main
 agents:
-  conductor:   { framework: claude_sdk, model: claude-sonnet-4-6 }
+  conductor:
+    framework: claude_sdk
+    model: claude-sonnet-4-6
   mergemaster:
     framework: claude_sdk
     model: claude-sonnet-4-6
-    test_command: "pytest"
-    auto_merge: "low"
-
+    test_command: null
+    review_guidelines: null
+    auto_merge: low
   planners:
-    claude_sdk: { count: 1, model: claude-sonnet-4-6 }
-    codex:      { count: 0 }
-  plan_reviewers:
-    claude_sdk: { count: 0 }
-    codex:      { count: 1, model: gpt-5.5 }
-    # review_guidelines: "Optional project-wide plan-review policy"
-  coders:
     claude_sdk:
       count: 1
-      model: claude-opus-4-7
-      description: "Strong at refactoring, testing, complex logic"
+      model: claude-sonnet-4-6
+      max_restarts: 5
+      restart_delay_seconds: 5.0
+    codex:
+      count: 0
+      model: null
+      max_restarts: 5
+      restart_delay_seconds: 5.0
+  plan_reviewers:
+    claude_sdk:
+      count: 0
+      model: null
+      max_restarts: 5
       restart_delay_seconds: 5.0
     codex:
       count: 1
       model: gpt-5.5
-      description: "Fast at bulk generation, boilerplate"
+      max_restarts: 5
+      restart_delay_seconds: 5.0
+    review_guidelines: null
+  coders:
+    claude_sdk:
+      count: 1
+      model: claude-opus-4-7
+      max_restarts: 5
+      restart_delay_seconds: 5.0
+    codex:
+      count: 1
+      model: gpt-5.5
+      max_restarts: 5
+      restart_delay_seconds: 5.0
   reviewers:
-    claude_sdk: { count: 1, model: claude-sonnet-4-6 }
-    codex:      { count: 1, model: gpt-5.5 }
-    # review_guidelines: "All public functions need docstrings. No raw SQL."
-
+    claude_sdk:
+      count: 1
+      model: claude-sonnet-4-6
+      max_restarts: 5
+      restart_delay_seconds: 5.0
+    codex:
+      count: 1
+      model: gpt-5.5
+      max_restarts: 5
+      restart_delay_seconds: 5.0
+    review_guidelines: null
+  verifiers:
+    claude_sdk:
+      count: 1
+      model: claude-opus-4-7
+      max_restarts: 5
+      restart_delay_seconds: 5.0
+    codex:
+      count: 1
+      model: gpt-5.5
+      max_restarts: 5
+      restart_delay_seconds: 5.0
   watchdog:
     check_interval_seconds: 120
     stale_threshold_seconds: 300
     nudge_grace_seconds: 60
-
+    nudge_suppression_seconds: 1800
+    role_stale_thresholds:
+      coder: 900
+      mergemaster: 900
+    swarm_idle_grace_seconds: 1800
+    max_phase_visits: 10
+    git_progress_check: true
+    full_integrity_interval_patrols: 30
+    transport_heal_enabled: true
+    transport_pin_threshold_seconds: 1800
+    transport_heal_max_attempts: 3
+    merge_approval_backstop_seconds: 240
+    merge_approval_backstop_max_renudges: 1
+    acceptance_advance_backstop_seconds: 240
+    acceptance_advance_max_renudges: 1
+  handoff_verify_command: null
+  required_verdicts: null
+  allow_ungated_merge: false
+  merge_approval: owner
+  max_review_rounds: 6
+  max_verify_attempts: 20
+  max_rebase_rounds: 3
+  verify_infra_exit_codes: null
+  idle_resync_seconds: 30
+  codex_turn_timeout_seconds: 3600
+  max_message_retries: 3
+  delivery: sdk
 workspace:
-  path: ".codeband"
-  worktree_prefix: "codeband"
-  mode: "local"
-
+  path: .codeband
+  worktree_prefix: codeband
+  mode: local
 band:
-  rest_url: "https://app.band.ai"
-  ws_url: "wss://app.band.ai/api/v1/socket/websocket"
-  memory_mode: "auto"
+  rest_url: https://app.band.ai
+  ws_url: wss://app.band.ai/api/v1/socket/websocket
+  memory_mode: auto
+  liveness_mode: auto
 ```
+
+`max_restarts` is deprecated and ignored at runtime, but current `cb init` output still emits it for every pool entry. Existing files may keep it; new behavior should be controlled with `restart_delay_seconds` and the reconnect-forever loop.
 
 ## Agent Count
 
@@ -67,8 +131,9 @@ The default pool is:
 | Plan Reviewer | 1 |
 | Coders | 2 |
 | Reviewers | 2 |
+| Verifiers | 2 |
 
-Total: 8 Band.ai agents. The Watchdog is an in-process daemon and does not use a Band.ai agent seat.
+Total: 10 Band.ai agents. The Watchdog is an in-process daemon and does not use a Band.ai agent seat.
 
 ## Frameworks
 
@@ -77,7 +142,7 @@ Total: 8 Band.ai agents. The Watchdog is an in-process daemon and does not use a
 | `claude_sdk` | Claude Code | Complex reasoning, refactoring, careful stepwise work |
 | `codex` | Codex | Bulk generation, boilerplate, fast iteration |
 
-Every role can use either framework. The default keeps Conductor and Mergemaster on Claude, pairs a Claude Planner with a Codex Plan Reviewer, and keeps one Coder and one Reviewer from each framework.
+Every role can use either framework. The default keeps Conductor and Mergemaster on Claude, pairs a Claude Planner with a Codex Plan Reviewer, and keeps one Coder, one Reviewer, and one Verifier from each framework.
 
 ## Cross-Model Pairing
 
@@ -87,8 +152,11 @@ Codeband enforces adversarial pairing through the agent prompts and Worker Pool 
 - Codex Coder PRs route to Claude Reviewers.
 - Claude plans route to Codex Plan Reviewers.
 - Codex plans route to Claude Plan Reviewers.
+- Reviewed work routes to an opposite-framework Verifier for acceptance when a verifier is configured.
 
 Coders dispatch first reviews directly to concrete reviewer display names, using deterministic worker-index pairing from the roster. For example, `Coder-Claude-1` prefers `Reviewer-Codex-1`; if only one Codex reviewer exists, it falls back to `Reviewer-Codex-0` and reports that reviewer capacity is shared. If an opposite-framework reviewer is unavailable, Codeband falls back to same-framework review with a warning. `cb doctor` warns when configuration makes cross-model pairing impossible or when reviewer capacity is lower than matching coder capacity.
+
+Verifiers follow the same adversarial preference. The default config has one Claude Verifier and one Codex Verifier, so a passing review must clear a SHA-pinned `verify_acceptance` verdict before merge. Set both `agents.verifiers.{claude_sdk,codex}.count` values to `0` to opt out; tasks then merge from `review_passed`.
 
 ## Scaling
 
@@ -153,6 +221,17 @@ agents:
   mergemaster:
     auto_merge: "low"  # all | low | medium | none
 ```
+
+## Merge Verdicts
+
+For fresh installs, `agents.required_verdicts: null` resolves at task registration time to `["review"]`, plus `verify_acceptance` whenever a verifier is configured. The local `verify` verdict is opt-in: set `agents.handoff_verify_command` to make `cb-phase verify` run that command and require its passing verdict before review.
+
+```yaml
+agents:
+  handoff_verify_command: "pytest"
+```
+
+With the default active verifier pool and no `handoff_verify_command`, tasks require `review` and `verify_acceptance`. With both verifier counts set to `0`, the default is just `review`. An explicit `required_verdicts` list is validated at task registration; `verify` requires `handoff_verify_command`, and `verify_acceptance` requires at least one configured verifier.
 
 ## Memory Backend
 
@@ -230,7 +309,7 @@ authenticates. All are optional; defaults are correct for a standard install.
 
 ## Manual Agent Registration (Free Tier)
 
-If `cb setup-agents` is unavailable, create these eight agents in the Band.ai web UI:
+If `cb setup-agents` is unavailable, create these ten agents in the Band.ai web UI:
 
 | Role | Recommended Band.ai name |
 |------|--------------------------|
@@ -242,6 +321,8 @@ If `cb setup-agents` is unavailable, create these eight agents in the Band.ai we
 | Codex coder | `Coder-Codex-0` |
 | Claude code reviewer | `Reviewer-Claude-0` |
 | Codex code reviewer | `Reviewer-Codex-0` |
+| Claude verifier | `Verifier-Claude-0` |
+| Codex verifier | `Verifier-Codex-0` |
 
 Then create `agent_config.yaml` next to `codeband.yaml`:
 
@@ -269,6 +350,12 @@ agents:
     agent_id: ...
     api_key:  ...
   reviewer-codex-0:
+    agent_id: ...
+    api_key:  ...
+  verifier-claude_sdk-0:
+    agent_id: ...
+    api_key:  ...
+  verifier-codex-0:
     agent_id: ...
     api_key:  ...
 ```
