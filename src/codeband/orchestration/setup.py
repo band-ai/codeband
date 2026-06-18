@@ -239,14 +239,12 @@ async def register_all_agents(
     agents (e.g., old player names or reduced pool counts), and registers
     any missing ones.
 
-    `detect_drift=True` (default, for `cb setup-agents`): also re-register
-    agents whose platform-side `description` no longer matches the canonical
-    description in `_SINGLETON_AGENTS` / `_POOL_ROLES`. Re-registration
-    rotates the agent's ID and api_key, so any session currently using the
-    old credential will fail on next reconnect. The auto-bootstrap path in
-    `runner.py:_ensure_agents_registered` passes `detect_drift=False` so that
-    starting `cb run` while another swarm is alive in a different terminal
-    cannot rotate that swarm's credentials out from under it.
+    `detect_drift=True` (default, for `cb setup-agents`): warn when an agent's
+    platform-side `description` no longer matches the canonical description in
+    `_SINGLETON_AGENTS` / `_POOL_ROLES`, but keep existing credentials in place.
+    The auto-bootstrap path in `runner.py:_ensure_agents_registered` passes
+    `detect_drift=False` to skip even that warning while another swarm may be
+    alive in a different terminal.
     """
     if client is None:
         api_key = os.environ.get("BAND_API_KEY")
@@ -302,7 +300,10 @@ async def register_all_agents(
             expected_desc = expected[matching_key][1]
             platform_desc = agent.description or ""
             if platform_desc != expected_desc:
-                delete_reason = _DeleteReason.DESCRIPTION_DRIFT
+                logger.warning(
+                    "Agent %s has description drift; leaving existing credentials in place",
+                    name,
+                )
         if delete_reason:
             try:
                 await client.human_api_agents.delete_my_agent(agent.id, force=True)
