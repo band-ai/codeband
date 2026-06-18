@@ -18,7 +18,7 @@ It is built for headless operation: local terminals, Linux servers, CI, Docker, 
 ## Why Codeband?
 
 - **Cross-model review by default**: Claude-written PRs are routed to Codex reviewers, and Codex-written PRs are routed to Claude reviewers.
-- **A real orchestration loop**: planner, plan reviewer, coders, code reviewers, mergemaster, and watchdog coordinate through Band.ai.
+- **A real orchestration loop**: planner, plan reviewer, coders, code reviewers, verifiers, mergemaster, and watchdog coordinate through Band.ai.
 - **Safe workspace isolation**: each coder works in a separate git worktree and opens a PR.
 - **Risk-aware merging**: low-risk PRs can auto-merge; medium, high, and critical changes wait for approval.
 - **Human-friendly and headless**: use the interactive shell locally, or run the same orchestrator in CI and Docker.
@@ -29,7 +29,7 @@ Codeband's main advantage is not raw parallelism; it is adversarial pairing. A t
 
 Parallel coders are useful when the Planner can split a task into independent subtasks with little file overlap. Each coder gets its own git worktree and branch, so separate subtasks can run at the same time without sharing a working directory. Parallel planners and plan reviewers are useful mostly for throughput across multiple queued tasks; for one task, a single Planner plus one opposite-framework Plan Reviewer is usually enough.
 
-The default configuration is the recommended shape: one Claude Coder, one Codex Coder, one Reviewer from each framework, one Planner, and one opposite-framework Plan Reviewer. You can scale pools with `/scale` in the shell or `cb scale`, then run `cb setup-agents` so Band.ai has matching agents.
+The default configuration is the recommended shape: one Claude Coder, one Codex Coder, one Reviewer from each framework, one Planner, one opposite-framework Plan Reviewer, and one Verifier from each framework. You can scale pools with `/scale` in the shell or `cb scale`, then run `cb setup-agents` so Band.ai has matching agents.
 
 For collision-free parallel review, keep opposite-framework reviewer capacity at least as large as coder capacity: Claude coders need Codex reviewers, and Codex coders need Claude reviewers. Today first-dispatch reviewer selection is prompt-enforced from the Worker Pool Roster using deterministic worker-index pairing; full code-backed arbitration is on the roadmap.
 
@@ -138,7 +138,7 @@ Inside the shell:
 
 Slash commands take the rest of the line as their argument, so `/task Add JWT authentication with tests` does not need quotes. In a normal terminal command, quote multi-word descriptions: `cb task "Add JWT authentication with tests"`.
 
-On free-tier Band.ai, `cb setup-agents` may not be available. Create the eight default agents manually and write `agent_config.yaml`; the exact keys are documented in [Configuration](docs/CONFIGURATION.md).
+On free-tier Band.ai, `cb setup-agents` may not be available. Create the ten default agents manually and write `agent_config.yaml`; the exact keys are documented in [Configuration](docs/CONFIGURATION.md).
 
 For credential precedence, Docker auth, and subscription-vs-API-key behavior, see [Authentication](docs/AUTHENTICATION.md).
 
@@ -180,10 +180,12 @@ Conductor
    |                                                  |
    +--> Codex Coder   -----> Claude Code Reviewer ---+--> Mergemaster
    |
+   +--> Verifiers (Claude + Codex acceptance gate)
+   |
    +--> Watchdog
 ```
 
-The default config uses eight Band.ai agents: Conductor, Mergemaster, one Planner, one Plan Reviewer, two Coders, and two Reviewers. The Watchdog is an in-process daemon and does not consume a Band.ai agent seat.
+The default config uses ten Band.ai agents: Conductor, Mergemaster, one Planner, one Plan Reviewer, two Coders, two Reviewers, and two Verifiers. The Watchdog is an in-process daemon and does not consume a Band.ai agent seat.
 
 For the full design, see [ARCHITECTURE.md](ARCHITECTURE.md).
 

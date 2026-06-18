@@ -454,9 +454,10 @@ def check_cross_model_pairing(ctx: Context) -> CheckResult:
 def check_verifier_pairing(ctx: Context) -> CheckResult:
     """Warn when the verifier pool can't pair opposite-vendor to any active coder.
 
-    Fires only when at least one verifier is configured (count > 0). When the
-    verifier seat is INERT (default count=0) this check is skipped — no noise
-    for users who haven't enabled verifiers yet.
+    Fires only when at least one verifier is configured (count > 0). The
+    product default configures one verifier per vendor, so this is normally an
+    active cross-vendor capacity check. Explicit verifier opt-out (both counts
+    set to 0) skips it.
     """
     if ctx.config is None:
         return CheckResult(Status.SKIP, "codeband.yaml not loaded")

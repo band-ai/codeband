@@ -31,10 +31,10 @@ def _gated_agents(**overrides) -> AgentsConfig:
     the fully gated registration mechanics use this config so they pass the
     verdict gate.
 
-    Verifiers are pinned INERT by default so the resolved snapshot stays the
-    ``verify``/``review`` pair these mechanics tests assert (the active product
-    default would couple in ``verify_acceptance``); the acceptance coupling has
-    its own tests in test_verifier_acceptance.py. Callers may override.
+    This helper explicitly opts verifiers out so the resolved snapshot stays
+    the ``verify``/``review`` pair these mechanics tests assert (the active
+    product default couples in ``verify_acceptance``); the acceptance coupling
+    has its own tests in test_verifier.py. Callers may override.
     """
     overrides.setdefault("verifiers", VerifiersConfig())
     return AgentsConfig(handoff_verify_command="true", **overrides)

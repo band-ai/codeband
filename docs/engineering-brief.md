@@ -23,13 +23,13 @@
 
 ## TL;DR
 
-We built and validated a working system in which **a single Claude Code session acts as the human-facing coordinator of an 8-agent autonomous coding swarm**, end to end, without the operator ever touching a chat UI. You type `/codeband <task>` inside any repo; Claude provisions itself an identity on the Band coordination platform, owns the task room, drives the swarm, watches GitHub and the process log out-of-band, and hands you back a reviewed PR.
+We built and validated a working system in which **a single Claude Code session acts as the human-facing coordinator of a 10-agent autonomous coding swarm**, end to end, without the operator ever touching a chat UI. You type `/codeband <task>` inside any repo; Claude provisions itself an identity on the Band coordination platform, owns the task room, drives the swarm, watches GitHub and the process log out-of-band, and hands you back a reviewed PR.
 
 Getting there required diverging from how the underlying tools (`jam`, `codeband`) are normally used, in several non-obvious ways that each cost real debugging. The two headline divergences:
 
 1. **We replaced a missing native capability with a synthesized one.** The intended design pushes inbound messages into Claude's turn automatically (via a harness feature called `TeamCreate`). That feature isn't in our Claude Code build. Rather than abandon the approach, we **synthesized "push" using a polling `Monitor`** on the message bridge's inbox file — Claude gets woken on every new message as if it were native push.
 
-2. **We are making codeband itself production-grade by separating two things it currently fuses:** *deciding* what to do (creative, dynamic — stays in the LLM) from *enforcing and recording* what is allowed to happen (mechanical — moves into code). This is a deterministic control plane — a state machine, durable storage, mechanical liveness signals, and universal crash-recovery — added **without** sacrificing the agent autonomy and parallelism that make codeband worth using. It is built, unit-tested, and currently **dormant by design**; the final "activation" flip is the next and riskiest step.
+2. **We are making codeband itself production-grade by separating two things it currently fuses:** *deciding* what to do (creative, dynamic — stays in the LLM) from *enforcing and recording* what is allowed to happen (mechanical — moves into code). This deterministic control plane — a state machine, durable storage, mechanical liveness signals, and universal crash-recovery — is now prompt-wired through `cb-phase`, so the LLM still decides the route while code enforces and remembers the effects.
 
 A third strand is **distribution and reuse**: `/codeband` is one concrete instance of a more general idea — *protocoled multi-agent patterns shipped as skills* — that we want to generalize well beyond Claude Code and well beyond coding.
 
@@ -48,13 +48,13 @@ A third strand is **distribution and reuse**: `/codeband` is one concrete instan
 
 # Part 1 — The `/codeband` command & the `jam` integration
 
-> **One-line:** `/codeband <task>` makes *this* Claude Code session the sole coordinator of an 8-agent codeband swarm running against the repo you're sitting in — and it does so by inserting Claude onto the Band platform as its own agent, owning the task room, and synthesizing the message-push and liveness signals that the stock tooling doesn't reliably provide.
+> **One-line:** `/codeband <task>` makes *this* Claude Code session the sole coordinator of a 10-agent codeband swarm running against the repo you're sitting in — and it does so by inserting Claude onto the Band platform as its own agent, owning the task room, and synthesizing the message-push and liveness signals that the stock tooling doesn't reliably provide.
 
 The command lives at `~/.claude/commands/codeband.md` (a user-level slash command, surfaced as the `codeband` skill) with an idempotent bootstrap at `~/.claude/codeband/setup.sh`.
 
 ## 1.1 The big picture
 
-There is a **shared "codeband home"** at `~/projects/codeband` that holds the API keys (`.env`) and the 8 Band-registered agents (`agent_config.yaml`). Each run re-points that home at the current repo's `origin` and runs from there. Because the home is shared, **only one swarm runs at a time** — switching repos wipes the prior workspace.
+There is a **shared "codeband home"** at `~/projects/codeband` that holds the API keys (`.env`) and the 10 Band-registered agents (`agent_config.yaml`). Each run re-points that home at the current repo's `origin` and runs from there. Because the home is shared, **only one swarm runs at a time** — switching repos wipes the prior workspace.
 
 The interesting engineering is *how a Claude Code session inserts itself as the coordinator* of a swarm it didn't create. The flow, end to end:
 
@@ -105,14 +105,14 @@ cd "$CB_HOME" && mkdir -p .ensemble && nohup codeband run > .ensemble/run.log 2>
 
 Claude then polls `.ensemble/run.log` for ~40s; on repeated `429`/preflight/auth/clone errors it kills the run and does **not** seed the task.
 
-### Create the room as itself, add the 8 agents, seed the task (Step 6)
+### Create the room as itself, add the 10 agents, seed the task (Step 6)
 
 This is the core trick, and it bypasses jam (see §1.4). An inline Python heredoc, run with codeband's bundled interpreter, uses the `thenvoi_rest` SDK directly:
 
 1. **Recover Claude's own agent key** by scanning `~/.config/jam/sessions/*/*.json` for the record whose `cwd` matches the target dir and pulling its `agent_api_key`.
 2. Build an `AsyncRestClient(api_key=cc_key, ...)` — **Claude now acts as itself over the Band REST API.**
 3. `create_agent_chat(...)` — **Claude owns the room.**
-4. For each of the 8 codeband agents: `add_agent_chat_participant(...)`.
+4. For each of the 10 codeband agents: `add_agent_chat_participant(...)`.
 5. Post the seed message `@`-mentioning the Conductor: *"here's a new task for the team. Please send it to the Planner … Report progress, questions, and PR-approval requests back to me in this room. Task: … Repository: …"*
 6. Persist the room id to `.codeband_room`.
 
@@ -380,18 +380,17 @@ The FSM never *silently* ignores a bad move — it raises `InvalidTransitionErro
 
 ## 2.7 Status, the dormancy nuance, and the risk that remains
 
-**P1–P5 phasing:** P0 baseline → P1 store (shadow) → P2 FSM + gated handoffs → P3 watchdog → P4 rehydration. **P1–P4 are landed** — built as one Claude Code session per phase, each in its own git worktree, each independently reviewed and merged. Test suite is green (**605 tests pass** in the current checkout; the 3 previously-noted pre-existing `CliRunner` failures were fixed by capping `click<9`).
+**Deterministic-orchestration phasing:** P0 baseline → P1 store (shadow) → P2 FSM + gated handoffs → P3 watchdog → P4 rehydration → P5 activation. These phases are landed in this fork, with the prompts now calling `cb-phase` for lifecycle effects and the merge path gated by SHA-pinned verdicts.
 
-**The crucial nuance: everything so far is additive and DORMANT by design.** The deterministic layer exists and is unit-tested, but nothing yet *calls* `cb-phase`, so subtask rows are never created in a live run, so the watchdog and rehydration have nothing to act on. We verified this directly: `prompts/conductor.md` still instructs only the old free-text `protocol task_assignment …` envelope — no agent is told to call the FSM or `cb-phase`. The phases built the **safety rails**; nobody is driving on them yet. (The FSM is currently exercised only by tests and by the watchdog's blocked path.)
+**The crucial nuance now:** the deterministic layer is not a central planner. The Conductor still decomposes, routes, and recovers creatively, but sanctioned effects move through `cb-phase`: Coder handoff to review, Reviewer verdicts, Verifier acceptance, merge eligibility, approval grants, abandon/resume, and blocked escalation. A rejected transition returns an actionable error; agents must recover or escalate, not route around the gate.
 
-**P5 — "activation"** is the payoff and the riskiest move: update `prompts/*.md` so coders actually call `cb-phase verify` before handoff and the Conductor/Mergemaster route transition *effects* through the FSM. This is the shadow→enforced flip where "the LLM decides, code enforces" finally takes effect. The central risk lives here — **the Conductor "fighting the gate"**: a rejected transition must come back as an *actionable* error the LLM recovers from (and, if needed, escalates to a human), not a loop. P5 therefore needs its own careful handoff and heavy end-to-end testing, separate from the safe additive phases.
+The remaining risk is operational, not dormancy: a real live run must keep the LLM and the gates in sync under retries, rebases, stale verdicts, and owner approvals. The design principle is still "the LLM decides, code enforces"; the practical bar is that every gate refusal teaches the agent what to do next.
 
 ### Roadmap from here
 
-1. **Targeted pre-E2E sweep** (report-only, diff-scoped): spec-vs-implementation (did the four sessions build the RFC faithfully?), dead-code/wiring (calibrated — shadow dormancy is *expected*), test-suite/flaky. *A static sweep explicitly cannot catch state/sequencing/race bugs — which is exactly what this feature is — so it complements, not replaces, E2E.*
-2. **E2E validation** — a real `cb run`; confirm store writes, FSM logs, watchdog mechanical signals, and a killed agent rehydrating.
-3. **P5 activation** — the enforced flip above.
-4. **Upstream to `thenvoi/codeband`** — the separable-module structure was designed for this; run the full "Master Sweep" audit right before sharing externally.
+1. **Targeted pre-E2E sweep** (report-only, diff-scoped): spec-vs-implementation, dead-code/wiring, test-suite/flaky. *A static sweep explicitly cannot catch state/sequencing/race bugs — which is exactly what this feature is — so it complements, not replaces, E2E.*
+2. **E2E validation** — a real `cb run`; confirm store writes, FSM logs, watchdog mechanical signals, verifier acceptance, stale-verdict rejection, and a killed agent rehydrating.
+3. **Upstream to `thenvoi/codeband`** — the separable-module structure was designed for this; run the full "Master Sweep" audit right before sharing externally.
 
 ### Key files in this repo
 
@@ -399,9 +398,9 @@ The FSM never *silently* ignores a bad move — it raises `InvalidTransitionErro
 - `src/codeband/state/store.py` / `fsm.py` / `rehydration.py`
 - `src/codeband/cli/handoff.py` (the `cb-phase` entry point in `pyproject.toml`)
 - `src/codeband/agents/watchdog.py`
-- `src/codeband/config.py` — knobs: `handoff_verify_command`, `max_phase_visits` (10), `git_progress_check`, `max_review_rounds` (3)
+- `src/codeband/config.py` — knobs: `handoff_verify_command`, `max_phase_visits` (10), `git_progress_check`, `max_review_rounds` (6)
 - `src/codeband/orchestration/runner.py` (store init, watchdog wiring, rehydration loop), `kickoff.py` (task-row write)
-- `src/codeband/prompts/conductor.md` — still old-protocol only (confirms gates are dormant)
+- `src/codeband/prompts/*.md` — role prompts that call `cb-phase` and treat gate output as authoritative
 - Tests: `tests/test_state_store.py`, `test_fsm.py`, `test_handoff.py`, `test_watchdog_upgrade.py`, `test_rehydration.py`
 
 ---
@@ -424,7 +423,7 @@ The FSM never *silently* ignores a bad move — it raises `InvalidTransitionErro
 | `jam` | `brew install ed-lepedus-thenvoi/tap/jam` | CC's Band bridge |
 | `codeband` | `uv tool install codeband` (public PyPI) | the swarm |
 | 3 keys | `BAND_API_KEY` (`band_u_…`), `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` → home `.env` | auth |
-| home config | `cb init` + `.env` + `cb setup-agents` (registers 8 Band agents) | the home |
+| home config | `cb init` + `.env` + `cb setup-agents` (registers 10 Band agents) | the home |
 
 ## 3.2 What already exists vs. what the skill adds
 
@@ -437,7 +436,7 @@ The FSM never *silently* ignores a bad move — it raises `InvalidTransitionErro
 5. configures the jam profile (`jam init --user-api-key …`, idempotent via `jam whoami`);
 6. creates the home + `cb init` (idempotent via `codeband.yaml`);
 7. writes `.env` (0600, always refreshed);
-8. registers the 8 Band agents (`cb setup-agents`, idempotent via `agent_config.yaml`);
+8. registers the 10 Band agents (`cb setup-agents`, idempotent via `agent_config.yaml`);
 9. finishes with `cb doctor`.
 
 The user only supplies the three keys. The global `codeband` tool stays the **PyPI build** (so the skill keeps working regardless of the dev fork).

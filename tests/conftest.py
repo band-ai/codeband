@@ -71,10 +71,10 @@ def sample_config(tmp_path: Path) -> CodebandConfig:
 
     Cross-model defaults: 1 Claude coder + 1 Codex coder, 1 of each
     reviewer, 1 Claude planner + 1 Codex plan-reviewer. Conductor +
-    Mergemaster default to Claude. Verifiers pinned INERT so this fixture
-    stays a coherent 8-agent pair with ``sample_agent_config`` (which carries
-    no verifier creds); verifier wiring has its own dedicated tests. Total: 8
-    Band.ai agents.
+    Mergemaster default to Claude. This fixture explicitly opts verifiers out
+    so it stays a coherent 8-agent pair with ``sample_agent_config`` (which
+    carries no verifier creds); verifier wiring has its own dedicated tests.
+    Total: 8 Band.ai agents.
     """
     return CodebandConfig(
         repo=RepoConfig(url="https://github.com/example/repo.git", branch="main"),
