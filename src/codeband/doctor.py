@@ -274,9 +274,29 @@ def check_codex_auth(ctx: Context) -> CheckResult:
     creates `~/.codex/` unconditionally as a bind-mount target, so a bare
     directory is not evidence that `codex login` was ever run.
     """
-    if os.environ.get("OPENAI_API_KEY"):
-        return CheckResult(Status.OK, "OPENAI_API_KEY set")
     auth_path = Path.home() / ".codex" / "auth.json"
+    api = os.environ.get("OPENAI_API_KEY")
+    if api and auth_path.exists():
+        prefer = os.environ.get("CODEBAND_CODEX_PREFER_API_KEY", "").strip().lower()
+        if prefer in ("1", "true", "yes", "on"):
+            return CheckResult(
+                Status.OK,
+                "Codex auth: OPENAI_API_KEY (CODEBAND_CODEX_PREFER_API_KEY override active — "
+                "ChatGPT subscription auth will not take precedence)",
+            )
+        return CheckResult(
+            Status.WARN,
+            "OPENAI_API_KEY set alongside Codex CLI login — "
+            "Codeband will start with the subscription and keep the API key as a fallback",
+            remediation=(
+                "This is valid. OPENAI_API_KEY is used only if the Codex "
+                "ChatGPT subscription path reports a usage-limit error.\n"
+                "Set CODEBAND_CODEX_PREFER_API_KEY=1 to force API-key precedence "
+                "(e.g. when parallel coders would exhaust subscription rate limits)."
+            ),
+        )
+    if api:
+        return CheckResult(Status.OK, "OPENAI_API_KEY set")
     if auth_path.exists():
         return CheckResult(
             Status.OK, f"Codex CLI login detected ({auth_path})",

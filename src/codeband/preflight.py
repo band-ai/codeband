@@ -172,6 +172,12 @@ _CODEX_ERROR_PATTERNS: list[tuple[str, str]] = [
 
 _CODEX_USAGE_LIMIT_PATTERNS = ("usage limit",)
 
+_CODEX_STRIPPED_API_KEY_PATTERNS = (
+    "not logged in",
+    "401 unauthorized",
+    "invalid api key",
+)
+
 
 async def _run_codex_probe() -> tuple[int, str]:
     """Run a minimal ``codex exec`` and return ``(returncode, combined_output)``.
@@ -226,7 +232,7 @@ async def check_codex_auth() -> PreflightError | None:
         )
 
     haystack = output.lower()
-    if _is_codex_usage_limit(haystack) and _restore_openai_api_key_fallback():
+    if _should_restore_openai_api_key_fallback(haystack):
         return await check_codex_auth()
     for pattern, remediation in _CODEX_ERROR_PATTERNS:
         if pattern in haystack:
@@ -254,15 +260,23 @@ def _is_codex_usage_limit(haystack: str) -> bool:
     return any(pattern in haystack for pattern in _CODEX_USAGE_LIMIT_PATTERNS)
 
 
-def _restore_openai_api_key_fallback() -> bool:
-    """Restore stripped OpenAI API-key auth after Codex subscription exhaustion."""
+def _should_restore_openai_api_key_fallback(haystack: str) -> bool:
+    if not os.environ.get("CODEBAND_FALLBACK_OPENAI_API_KEY"):
+        return False
+    if _is_codex_usage_limit(haystack):
+        return _restore_openai_api_key_fallback("subscription usage limit reached")
+    if any(pattern in haystack for pattern in _CODEX_STRIPPED_API_KEY_PATTERNS):
+        return _restore_openai_api_key_fallback("Codex requested API-key auth")
+    return False
+
+
+def _restore_openai_api_key_fallback(reason: str) -> bool:
+    """Restore stripped OpenAI API-key auth after subscription fallback signals."""
     fallback_key = os.environ.pop("CODEBAND_FALLBACK_OPENAI_API_KEY", "")
     if not fallback_key or os.environ.get("OPENAI_API_KEY"):
         return False
     os.environ["OPENAI_API_KEY"] = fallback_key
-    logger.info(
-        "Codex subscription usage limit reached; retrying preflight with OPENAI_API_KEY"
-    )
+    logger.info("%s; retrying preflight with OPENAI_API_KEY", reason)
     return True
 
 

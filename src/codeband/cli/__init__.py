@@ -158,7 +158,7 @@ def _resolve_claude_auth() -> None:
     # Explicit opt-out of subscription-first. Set CODEBAND_CLAUDE_PREFER_API_KEY=1
     # to keep ANTHROPIC_API_KEY even when an OAuth source exists, restoring the
     # Claude CLI's native precedence (API key over OAuth) — e.g. when parallel
-    # coders would exhaust a subscription's rate limits. Codex is unaffected.
+    # coders would exhaust a subscription's rate limits.
     if os.environ.get("CODEBAND_CLAUDE_PREFER_API_KEY", "").strip().lower() in (
         "1", "true", "yes", "on",
     ):
@@ -202,6 +202,13 @@ def _resolve_codex_auth() -> None:
     if the subscription path reports usage-limit exhaustion.
     """
     if not os.environ.get("OPENAI_API_KEY"):
+        return
+    # Explicit opt-out of subscription-first. Set CODEBAND_CODEX_PREFER_API_KEY=1
+    # to keep OPENAI_API_KEY even when ChatGPT subscription auth exists, restoring
+    # the Codex CLI's native API-key path for parallel workloads.
+    if os.environ.get("CODEBAND_CODEX_PREFER_API_KEY", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
         return
     if _has_codex_subscription_auth():
         os.environ.setdefault(
@@ -308,6 +315,7 @@ def init(repo: str, branch: str, project_dir: str) -> None:
         "#   3. ANTHROPIC_API_KEY fallback only if subscription usage is exhausted\n"
         "# Codeband auto-strips ANTHROPIC_API_KEY while subscription auth is usable,\n"
         "# then restores it only after a Claude Pro/Max usage-limit error.\n"
+        "# Set CODEBAND_CLAUDE_PREFER_API_KEY=1 to force API-key precedence.\n"
         "#\n"
         "# Option A: Anthropic API key — pay-per-token, no subscription caps.\n"
         "ANTHROPIC_API_KEY=sk-ant-...\n"
@@ -325,6 +333,7 @@ def init(repo: str, branch: str, project_dir: str) -> None:
         "# If OPENAI_API_KEY is also set, it is used only after Codex reports\n"
         "# a subscription usage-limit error. If you don't use Codex agents,\n"
         "# leave this unset.\n"
+        "# Set CODEBAND_CODEX_PREFER_API_KEY=1 to force API-key precedence.\n"
         "OPENAI_API_KEY=sk-...\n"
         "#\n"
         "# ── Platform & GitHub ───────────────────────────────────────────\n"

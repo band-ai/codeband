@@ -26,14 +26,18 @@ Claude agents can authenticate in three ways. Codeband resolves them in this ord
 
 When subscription auth is available, Codeband strips `ANTHROPIC_API_KEY` from the spawned Claude process so the Claude CLI does not silently prefer API-key billing over subscription auth. `cb doctor` warns when both are present.
 
+Set `CODEBAND_CLAUDE_PREFER_API_KEY=1` to keep API-key precedence when both auth methods are present.
+
 ## Codex
 
-Codex agents can use either:
+Codex agents can authenticate in two ways. Codeband resolves them in this order at `cb run` startup:
 
-- `OPENAI_API_KEY`, recommended for automation and parallel agents.
-- Host login from `codex login --device-auth`, useful for low-volume local runs.
+1. Host ChatGPT subscription login from `codex login --device-auth`, stored in `~/.codex/auth.json`.
+2. `OPENAI_API_KEY`, for pay-per-token usage.
 
-Codex is intentionally API-key-first. If `OPENAI_API_KEY` and subscription login are both present, the API key wins.
+When ChatGPT subscription auth is available, Codeband strips `OPENAI_API_KEY` from the spawned Codex process so the Codex CLI does not silently prefer API-key billing over subscription auth. Preflight restores the stripped key if the subscription path reports usage-limit exhaustion or if Codex falls into an API-key-required auth mode. `cb doctor` warns when both are present.
+
+Set `CODEBAND_CODEX_PREFER_API_KEY=1` to keep API-key precedence when both auth methods are present.
 
 For Docker, mount or provide credentials explicitly:
 

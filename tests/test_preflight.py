@@ -317,6 +317,24 @@ class TestCheckCodexAuth:
         assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
 
     @pytest.mark.asyncio
+    async def test_stripped_api_key_mode_failure_retries_with_fallback(self, monkeypatch):
+        from codeband.preflight import check_codex_auth
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("CODEBAND_FALLBACK_OPENAI_API_KEY", "sk-openai-fallback")
+
+        with patch(
+            "codeband.preflight._run_codex_probe",
+            AsyncMock(side_effect=[(1, "Error: not logged in."), (0, "ok")]),
+        ) as mock_probe:
+            err = await check_codex_auth()
+
+        assert err is None
+        assert mock_probe.await_count == 2
+        assert os.environ["OPENAI_API_KEY"] == "sk-openai-fallback"
+        assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
+
+    @pytest.mark.asyncio
     async def test_detects_invalid_api_key(self):
         from codeband.preflight import check_codex_auth
 

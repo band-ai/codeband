@@ -181,6 +181,34 @@ class TestCodexAuth:
         result = check_codex_auth(Context(project_dir=tmp_path))
         assert result.status == Status.OK
 
+    def test_openai_key_plus_codex_login_warns(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        codex_dir = home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+
+        result = check_codex_auth(Context(project_dir=tmp_path))
+
+        assert result.status == Status.WARN
+        assert "subscription" in result.message.lower()
+        assert "CODEBAND_CODEX_PREFER_API_KEY" in result.remediation
+
+    def test_prefer_api_key_flag_with_codex_login_is_ok(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        codex_dir = home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+        monkeypatch.setenv("CODEBAND_CODEX_PREFER_API_KEY", "1")
+
+        result = check_codex_auth(Context(project_dir=tmp_path))
+
+        assert result.status == Status.OK
+        assert "CODEBAND_CODEX_PREFER_API_KEY" in result.message
+
     def test_empty_codex_dir_does_not_pass(self, monkeypatch, tmp_path):
         """`cb up` creates ~/.codex as a bind-mount target, so an empty
         directory is not evidence of a completed `codex login`. The check

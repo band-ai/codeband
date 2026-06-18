@@ -180,6 +180,44 @@ class TestResolveCodexAuth:
         assert "OPENAI_API_KEY" not in os.environ
         assert os.environ["CODEBAND_FALLBACK_OPENAI_API_KEY"] == "sk-test"
 
+    def test_prefer_api_key_flag_retains_key_when_subscription_auth_present(
+        self, monkeypatch, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(
+            '{"auth_mode": "chatgpt", "tokens": {}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("CODEBAND_CODEX_PREFER_API_KEY", "true")
+        monkeypatch.delenv("CODEBAND_FALLBACK_OPENAI_API_KEY", raising=False)
+
+        _resolve_codex_auth()
+
+        assert os.environ["OPENAI_API_KEY"] == "sk-test"
+        assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
+
+    def test_prefer_api_key_flag_absent_does_not_change_existing_behavior(
+        self, monkeypatch, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(
+            '{"auth_mode": "chatgpt", "tokens": {}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.delenv("CODEBAND_CODEX_PREFER_API_KEY", raising=False)
+        monkeypatch.delenv("CODEBAND_FALLBACK_OPENAI_API_KEY", raising=False)
+
+        _resolve_codex_auth()
+
+        assert "OPENAI_API_KEY" not in os.environ
+        assert os.environ["CODEBAND_FALLBACK_OPENAI_API_KEY"] == "sk-test"
+
     def test_non_chatgpt_auth_file_does_not_strip_api_key(self, monkeypatch, tmp_path):
         codex_home = tmp_path / ".codex"
         codex_home.mkdir()
