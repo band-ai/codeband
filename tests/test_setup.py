@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
@@ -359,13 +360,11 @@ class TestSetupDeletesExcess:
 
 class TestSetupDriftDetection:
     """When the registered description on Band.ai drifts from the canonical
-    description in setup.py, the platform agent must be deleted and a fresh
-    one registered (Band.ai has no in-place agent-update API, so re-registration
-    is the only way to fix drift). The local cred for that key is also dropped
-    so the new agent gets fresh credentials."""
+    description in setup.py, setup-agents warns but preserves the live
+    platform agent and local credentials."""
 
     @pytest.mark.asyncio
-    async def test_drift_triggers_delete_and_reregister(self, tmp_path):
+    async def test_drift_warns_and_preserves_credentials(self, tmp_path, caplog):
         from codeband.orchestration.setup import register_all_agents
 
         config = _make_config()
@@ -385,58 +384,29 @@ class TestSetupDriftDetection:
 
         _DEFAULT_AGENT_CONFIG.to_yaml(tmp_path / "agent_config.yaml")
 
-        register_count = 0
-
-        async def fake_register(*, agent, **kwargs):
-            nonlocal register_count
-            register_count += 1
-            return FakeRegisterResponse(
-                data=FakeRegisterData(
-                    agent=FakeAgent(
-                        id=f"re-registered-{register_count}",
-                        name=agent.name,
-                        description=agent.description,
-                    ),
-                    credentials=FakeCredentials(
-                        api_key=f"new-key-{register_count}",
-                    ),
-                )
-            )
-
         client = AsyncMock()
         client.human_api_agents.list_my_agents.return_value = FakeListResponse(
             data=platform,
         )
-        client.human_api_agents.register_my_agent.side_effect = fake_register
-        client.human_api_agents.delete_my_agent.return_value = FakeDeleteResponse(
-            id="deleted",
-            name="deleted",
+
+        with caplog.at_level(logging.WARNING, logger="codeband.orchestration.setup"):
+            await register_all_agents(config, tmp_path, client=client)
+
+        # Description-only drift is non-destructive: the live agent stays in place.
+        client.human_api_agents.delete_my_agent.assert_not_called()
+        client.human_api_agents.register_my_agent.assert_not_called()
+
+        assert any(
+            record.levelno == logging.WARNING
+            and record.name == "codeband.orchestration.setup"
+            and "Coder-Codex-0" in record.message
+            for record in caplog.records
         )
 
-        await register_all_agents(config, tmp_path, client=client)
-
-        # Exactly the drifting agent should be deleted from Band.ai.
-        deleted_ids = {
-            call.args[0] for call in client.human_api_agents.delete_my_agent.call_args_list
-        }
-        assert deleted_ids == {"co-x-0"}
-
-        # And exactly one fresh registration happened (the replacement).
-        assert client.human_api_agents.register_my_agent.call_count == 1
-        registered_name = client.human_api_agents.register_my_agent.call_args[1]["agent"].name
-        assert registered_name == "Coder-Codex-0"
-
-        # The local agent_config now has the new ID and key for that role.
+        # The local agent_config keeps the existing ID and key for that role.
         result = AgentConfigFile.from_yaml(tmp_path / "agent_config.yaml")
-        assert result.agents["coder-codex-0"].agent_id != "co-x-0"
-        assert result.agents["coder-codex-0"].agent_id.startswith("re-registered-")
-        # The api_key must also be the freshly-issued one, not the old key.
-        # This proves `existing_config.agents.pop(matching_key, None)` actually
-        # ran. If a regression removed that pop, the agent_id assertion above
-        # would still pass (the main loop overwrites on register), but the
-        # api_key would silently leak through unchanged from the old creds.
-        assert result.agents["coder-codex-0"].api_key.startswith("new-key-")
-        assert result.agents["coder-codex-0"].api_key != "key-co-x0"
+        assert result.agents["coder-codex-0"].agent_id == "co-x-0"
+        assert result.agents["coder-codex-0"].api_key == "key-co-x0"
         # Other agents are unchanged.
         assert result.agents["conductor"].agent_id == "cond-0"
         assert result.agents["coder-claude_sdk-0"].agent_id == "co-c-0"
