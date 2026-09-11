@@ -4,6 +4,34 @@ All notable user-facing changes to Codeband should be documented here.
 
 This project is currently in alpha. Until the first stable release, minor versions may include breaking changes; migration notes should be linked from the relevant release entry.
 
+## 0.1.2 - Unreleased
+
+- Codeband is now in **maintenance only**: it is kept working against the current
+  Band.ai SDK, but no new features are planned. New projects should use
+  [Jam](https://docs.band.ai/jam), which connects Claude Code (and other agents
+  via MCP) to Band without adopting Codeband's orchestrator.
+- Updated to band-sdk 3.0.0 (from 0.2.8). Required changes:
+  - Replaced the retired `thenvoi_rest` REST client with `band.client.rest`
+    (and `band_rest` for the few types that wrapper does not re-export).
+  - Adapters take `emit=` / `capabilities=` directly instead of
+    `features=AdapterFeatures(...)`, and `Emit.EXECUTION` is now `Emit.TOOL_CALLS`
+    (both band-sdk 2.0.0).
+  - `CodexAdapterConfig` no longer accepts `approval_mode=None` or `cwd=None`.
+    Codex `approval_mode` is now set per privilege level — `auto_accept` for the
+    full-access roles (Coder, Code Reviewer, Mergemaster), `auto_decline` for the
+    read-only ones (Conductor, Planner, Plan Reviewer). Neither routes approvals
+    to a human, which would stall a headless run.
+- Fixed: Codex Coders, Planners, Plan Reviewers, and Code Reviewers lost their
+  Band memory tools under band-sdk 2.0.0, which made `capabilities` opt-in. Their
+  prompts still instructed them to call `band_store_memory` / `band_list_memories`,
+  so every memory-backed protocol silently broke for those roles. All adapters now
+  declare `capabilities` explicitly, pinned by `tests/test_adapter_features.py`.
+- Removed the `subject_id=None` monkey-patch on `AgentTools.store_memory`; band-sdk
+  omits the field itself now.
+- Pinned `mcp>=1.28.1,<2`: band-sdk's Claude/Codex extras import
+  `mcp.server.fastmcp`, which mcp 2.x removed, but do not constrain the version.
+- Fixed tests for click 8.2, which removed `CliRunner(mix_stderr=...)`.
+
 ## 0.1.1 - 2026-05-07
 
 - Added OSS community files, issue templates, and CI workflow.

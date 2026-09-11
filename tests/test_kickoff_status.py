@@ -65,7 +65,7 @@ class TestQueryStatus:
             scope="organization", thought="test command",
         )
 
-        with patch("thenvoi_rest.AsyncRestClient"):
+        with patch("band.client.rest.AsyncRestClient"):
             await query_status(config, project_dir)
 
         out = capsys.readouterr().out
@@ -88,7 +88,7 @@ class TestQueryStatus:
             scope="organization", thought="plan ready",
         )
 
-        with patch("thenvoi_rest.AsyncRestClient"):
+        with patch("band.client.rest.AsyncRestClient"):
             await query_status(config, project_dir, command_style="slash")
 
         out = capsys.readouterr().out
@@ -100,7 +100,7 @@ class TestQueryStatus:
     ):
         config = _make_config(project_dir, memory_mode="local")
 
-        with patch("thenvoi_rest.AsyncRestClient"):
+        with patch("band.client.rest.AsyncRestClient"):
             await query_status(config, project_dir)
 
         assert "No active tasks or knowledge found." in capsys.readouterr().out
@@ -125,7 +125,7 @@ class TestQueryStatus:
             side_effect=[_FakeResp([_FakeMem()]), _FakeResp([_FakeMem()])],
         )
 
-        with patch("thenvoi_rest.AsyncRestClient", return_value=fake_client):
+        with patch("band.client.rest.AsyncRestClient", return_value=fake_client):
             await query_status(config, project_dir)
 
         out = capsys.readouterr().out

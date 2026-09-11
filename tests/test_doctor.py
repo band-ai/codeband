@@ -467,7 +467,7 @@ class TestActiveRoomMembership:
             c.agent_api_participants.list_agent_chat_participants = fake_list
             return c
 
-        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+        with patch("band.client.rest.AsyncRestClient", side_effect=fake_client):
             result = await check_active_room_membership(ctx)
 
         assert result.status == Status.INFO
@@ -494,7 +494,7 @@ class TestActiveRoomMembership:
             c.agent_api_participants.list_agent_chat_participants = fake_list
             return c
 
-        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+        with patch("band.client.rest.AsyncRestClient", side_effect=fake_client):
             result = await check_active_room_membership(ctx)
 
         assert result.status == Status.WARN
@@ -566,7 +566,7 @@ class TestRunAll:
             c.agent_api_memories.list_agent_memories = fake_list
             return c
 
-        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+        with patch("band.client.rest.AsyncRestClient", side_effect=fake_client):
             ctx, exit_code = await run_all(tmp_path)
         assert exit_code == 0, {n: (r.status.value, r.message) for n, r in ctx.results.items()}
         assert ctx.results["Band.ai REST reachable"].status == Status.OK

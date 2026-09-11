@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from codeband.models import CODEX_GPT
@@ -35,6 +36,7 @@ class CodexPlayerRunner:
         try:
             from band.adapters import CodexAdapter
             from band.adapters.codex import CodexAdapterConfig
+            from band.core.types import Capability, Emit
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "
@@ -56,12 +58,16 @@ class CodexPlayerRunner:
         config = CodexAdapterConfig(
             model=model,
             system_prompt=prompt,
-            cwd=workspace,
+            cwd=workspace or os.getcwd(),
             approval_policy="never",
-            approval_mode=None,
+            approval_mode="auto_accept",
             sandbox="danger-full-access",
         )
-        self._adapter = CodexAdapter(config=config)
+        self._adapter = CodexAdapter(
+            config=config,
+            emit={Emit.TOOL_CALLS, Emit.THOUGHTS},
+            capabilities={Capability.MEMORY},
+        )
 
     @property
     def adapter(self):

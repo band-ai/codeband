@@ -523,7 +523,7 @@ def _conductor_rest_client(ctx: Context):
     """Return an AsyncRestClient using the Conductor's creds, or a CheckResult to short-circuit.
 
     Three checks below need the same setup: config + agent_config + conductor creds
-    + the deferred thenvoi_rest import. Caller does `isinstance(r, CheckResult)`
+    + the deferred band.client.rest import. Caller does `isinstance(r, CheckResult)`
     to decide whether to return early.
     """
     if ctx.config is None or ctx.agent_config is None:
@@ -532,9 +532,9 @@ def _conductor_rest_client(ctx: Context):
     if conductor is None:
         return CheckResult(Status.SKIP, "Conductor creds not registered")
     try:
-        from thenvoi_rest import AsyncRestClient
+        from band.client.rest import AsyncRestClient
     except ImportError as exc:
-        return CheckResult(Status.FAIL, f"thenvoi_rest not importable: {exc}")
+        return CheckResult(Status.FAIL, f"band.client.rest not importable: {exc}")
     return AsyncRestClient(
         api_key=conductor.api_key, base_url=ctx.config.band.rest_url,
     )

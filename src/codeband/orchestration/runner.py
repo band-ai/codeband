@@ -234,48 +234,6 @@ def _get_tools_class():
     )
 
 
-def _patch_band_subject_id_bug() -> None:
-    """Work around band-sdk bug: strip subject_id=None before API call."""
-    cls = _get_tools_class()
-    if cls is None or getattr(cls.store_memory, "_codeband_patched", False):
-        return
-
-    async def _patched_store_memory(
-        self,
-        content,
-        system,
-        type,
-        segment,
-        thought,
-        scope="subject",
-        subject_id=None,
-        metadata=None,
-    ):
-        from band.client.rest import MemoryCreateRequest
-
-        kwargs = dict(
-            content=content,
-            system=system,
-            type=type,
-            segment=segment,
-            thought=thought,
-            scope=scope,
-            metadata=metadata,
-        )
-        if subject_id is not None:
-            kwargs["subject_id"] = subject_id
-
-        response = await self.rest.agent_api_memories.create_agent_memory(
-            memory=MemoryCreateRequest(**kwargs)
-        )
-        if not response.data:
-            raise RuntimeError("Failed to store memory - no response data")
-        return response.data
-
-    _patched_store_memory._codeband_patched = True
-    cls.store_memory = _patched_store_memory
-
-
 def _patch_agent_tools_to_local_store(store) -> None:
     """Redirect AgentTools memory methods at `store` (a LocalMemoryStore)."""
     cls = _get_tools_class()
@@ -366,7 +324,6 @@ async def _install_memory_backend(
         print(status_line)
         print(f"Memory: local JSONL store at {store_path}")
     else:
-        _patch_band_subject_id_bug()
         print(status_line)
         print("Memory: Band.ai remote API")
 

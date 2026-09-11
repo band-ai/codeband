@@ -280,8 +280,8 @@ class WatchdogDaemon:
         # don't need older records to make a decision.
         since = now - self._max_window() * 2
 
-        from thenvoi_rest.core.api_error import ApiError
-        from thenvoi_rest.errors.not_found_error import NotFoundError
+        from band_rest.core.api_error import ApiError
+        from band.client.rest import NotFoundError
 
         try:
             rooms = await self._list_rooms()
@@ -457,7 +457,7 @@ class WatchdogDaemon:
         self, room_id: str, agent_id: str, names: dict[str, str],
     ) -> None:
         """Send a nudge message to a stale agent."""
-        from thenvoi_rest.types import ChatMessageRequest, ChatMessageRequestMentionsItem
+        from band.client.rest import ChatMessageRequest, ChatMessageRequestMentionsItem
 
         logger.info("Nudging stale agent %s in room %s", agent_id, room_id)
         if self._activity:
@@ -505,7 +505,7 @@ class WatchdogDaemon:
                 "AGENT_ESCALATED", "watchdog",
                 f"Escalated {agent_id} (unresponsive {minutes:.0f}m)",
             )
-        from thenvoi_rest.types import ChatMessageRequest, ChatMessageRequestMentionsItem
+        from band.client.rest import ChatMessageRequest, ChatMessageRequestMentionsItem
 
         display = names.get(agent_id, agent_id)
         await self._rest.agent_api_messages.create_agent_chat_message(

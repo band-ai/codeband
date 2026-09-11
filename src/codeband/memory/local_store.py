@@ -70,6 +70,12 @@ class LocalMemoryStore:
 
     Thread/process-safe for writes via `fcntl.flock`. Reads are full-scan
     with in-memory filtering.
+
+    Covers the three memory tools codeband's prompts actually use — store,
+    list, archive (see `runner._patch_agent_tools_to_local_store`). band-sdk
+    also exposes `band_get_memory` and `band_supersede_memory`; those are not
+    redirected here, so on free tier an agent that calls one reaches Band.ai
+    and fails. No prompt names them, so this has not come up.
     """
 
     def __init__(self, path: Path) -> None:

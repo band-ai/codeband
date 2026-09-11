@@ -2,6 +2,12 @@
 
 Thanks for taking the time to improve Codeband. This project is early-stage, so the best contributions are focused, easy to review, and tied to a concrete issue or user workflow.
 
+**Before you start:** Codeband is in maintenance only — it is kept working against
+the current Band.ai SDK, but no new features are planned. Bug fixes, compatibility
+updates, and doc corrections are welcome; larger feature work is better directed at
+[Jam](https://docs.band.ai/jam), which is where agent-to-agent coordination on Band
+is developed now.
+
 ## Good First Contributions
 
 Good starter areas:

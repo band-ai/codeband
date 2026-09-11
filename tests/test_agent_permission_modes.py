@@ -69,3 +69,46 @@ class TestCodingPermissionModesUnchanged:
 
         assert kwargs["permission_mode"] == "bypassPermissions"
         assert kwargs["approval_mode"] is None
+
+
+class TestCodexApprovalModes:
+    """Codex approval modes must never fall back to the blocking default.
+
+    band-sdk 2.x made ``CodexAdapterConfig.approval_mode`` a required literal
+    (``auto_accept`` / ``auto_decline`` / ``manual``) that rejects ``None``,
+    defaulting to ``manual``. ``manual`` routes each approval to a human in the
+    Band room and waits ``approval_wait_timeout_s`` (300s) — which stalls a
+    headless swarm. Each role instead mirrors its own privilege level.
+    """
+
+    def _config(self, constructor, **init_kwargs):
+        with patch("band.adapters.CodexAdapter") as mock_adapter:
+            mock_adapter.return_value = MagicMock()
+            constructor(**init_kwargs)
+        assert mock_adapter.call_count == 1, mock_adapter.call_args_list
+        return mock_adapter.call_args.kwargs["config"]
+
+    def test_full_access_roles_auto_accept(self, tmp_path):
+        from codeband.agents.code_reviewer import CodexCodeReviewerRunner
+        from codeband.agents.mergemaster import CodexMergemasterRunner
+        from codeband.agents.player_codex import CodexPlayerRunner
+
+        for cls in (CodexPlayerRunner, CodexCodeReviewerRunner, CodexMergemasterRunner):
+            config = self._config(cls, workspace=str(tmp_path))
+            assert config.sandbox == "danger-full-access", cls.__name__
+            assert config.approval_mode == "auto_accept", cls.__name__
+
+    def test_read_only_roles_auto_decline(self, tmp_path):
+        from codeband.agents.conductor import CodexConductorRunner
+        from codeband.agents.plan_reviewer import CodexPlanReviewerRunner
+        from codeband.agents.planner import CodexPlannerRunner
+
+        cases = [
+            (CodexPlannerRunner, {"workspace": str(tmp_path)}),
+            (CodexPlanReviewerRunner, {"workspace": str(tmp_path)}),
+            (CodexConductorRunner, {}),
+        ]
+        for cls, kwargs in cases:
+            config = self._config(cls, **kwargs)
+            assert config.sandbox == "read-only", cls.__name__
+            assert config.approval_mode == "auto_decline", cls.__name__

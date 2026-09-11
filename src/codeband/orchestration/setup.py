@@ -28,7 +28,7 @@ from codeband.config import (
 from codeband.workers import WorkerId
 
 if TYPE_CHECKING:
-    from thenvoi_rest import AsyncRestClient
+    from band.client.rest import AsyncRestClient
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ async def register_all_agents(
                 "BAND_API_KEY environment variable is required. "
                 "Get one from https://platform.band.ai"
             )
-        from thenvoi_rest import AsyncRestClient
+        from band.client.rest import AsyncRestClient
         client = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
 
     # Load existing credentials if available
@@ -239,7 +239,7 @@ async def _register_agent(
     description: str,
 ) -> AgentCredentials:
     """Register a single agent and return credentials."""
-    from thenvoi_rest.types import AgentRegisterRequest
+    from band_rest.types import AgentRegisterRequest
 
     response = await client.human_api_agents.register_my_agent(
         agent=AgentRegisterRequest(name=name, description=description)

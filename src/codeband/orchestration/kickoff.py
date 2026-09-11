@@ -29,9 +29,9 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     The human running this command is the room creator and task sender.
     Requires BAND_API_KEY environment variable (the human's API key).
     """
-    from thenvoi_rest import AsyncRestClient, ChatMessageRequest, ParticipantRequest
-    from thenvoi_rest.human_api_chats import CreateMyChatRoomRequestChat
-    from thenvoi_rest.types import ChatMessageRequestMentionsItem as Mention
+    from band.client.rest import AsyncRestClient, ChatMessageRequest, ParticipantRequest
+    from band_rest.human_api_chats import CreateMyChatRoomRequestChat
+    from band.client.rest import ChatMessageRequestMentionsItem as Mention
 
     api_key = _require_api_key()
     human_client = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
@@ -107,8 +107,8 @@ async def send_room_message(
     Reads the room ID from .codeband_room (written by send_task) and sends
     the message @mentioning the Conductor. Does NOT create a new room.
     """
-    from thenvoi_rest import AsyncRestClient, ChatMessageRequest
-    from thenvoi_rest.types import ChatMessageRequestMentionsItem as Mention
+    from band.client.rest import AsyncRestClient, ChatMessageRequest
+    from band.client.rest import ChatMessageRequestMentionsItem as Mention
 
     room_file = project_dir / ".codeband_room"
     try:
@@ -293,7 +293,7 @@ async def query_status(
     from the resolved backend. On free tier this means the local JSONL store;
     on paid tier it hits the Band.ai REST API.
     """
-    from thenvoi_rest import AsyncRestClient
+    from band.client.rest import AsyncRestClient
 
     from codeband.memory import probe_memory_backend
 
@@ -371,7 +371,7 @@ async def _remove_agents_from_room(
     logged at debug level and otherwise swallowed so a single agent's failure
     doesn't block the rest.
     """
-    from thenvoi_rest import AsyncRestClient
+    from band.client.rest import AsyncRestClient
 
     for key, creds in agent_config.agents.items():
         try:
@@ -426,9 +426,9 @@ async def reset_stale_rooms(config: CodebandConfig, project_dir: Path) -> list[s
 
     Returns the list of stale room ids it attempted to clear.
     """
-    from thenvoi_rest import AsyncRestClient
-    from thenvoi_rest.core.api_error import ApiError
-    from thenvoi_rest.errors.not_found_error import NotFoundError
+    from band.client.rest import AsyncRestClient
+    from band_rest.core.api_error import ApiError
+    from band.client.rest import NotFoundError
 
     agent_config = load_agent_config(project_dir)
     conductor = agent_config.get("conductor")
