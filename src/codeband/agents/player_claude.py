@@ -31,7 +31,7 @@ class ClaudePlayerRunner:
         identity_section: str | None = None,
     ):
         from band.adapters import ClaudeSDKAdapter
-        from band.core.types import AdapterFeatures, Capability, Emit
+        from band.core.types import Capability, Emit
 
         self.model = model
         from codeband.agents.prompts import load_prompt
@@ -49,10 +49,8 @@ class ClaudePlayerRunner:
             custom_section=prompt,
             permission_mode="bypassPermissions",
             approval_mode=None,
-            features=AdapterFeatures(
-                emit={Emit.EXECUTION, Emit.THOUGHTS},
-                capabilities={Capability.MEMORY},
-            ),
+            emit={Emit.TOOL_CALLS, Emit.THOUGHTS},
+            capabilities={Capability.MEMORY},
             cwd=workspace,
         )
 

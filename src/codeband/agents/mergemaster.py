@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from codeband.models import CLAUDE_SONNET, CODEX_GPT
@@ -49,7 +50,7 @@ class ClaudeMergemasterRunner:
         identity_section: str | None = None,
     ):
         from band.adapters import ClaudeSDKAdapter
-        from band.core.types import AdapterFeatures, Capability, Emit
+        from band.core.types import Capability, Emit
 
         prompt = _compose_prompt(
             custom_prompt, test_command, review_guidelines, identity_section,
@@ -60,10 +61,8 @@ class ClaudeMergemasterRunner:
             custom_section=prompt,
             permission_mode="bypassPermissions",
             approval_mode=None,
-            features=AdapterFeatures(
-                emit={Emit.EXECUTION, Emit.THOUGHTS},
-                capabilities={Capability.MEMORY},
-            ),
+            emit={Emit.TOOL_CALLS, Emit.THOUGHTS},
+            capabilities={Capability.MEMORY},
             cwd=workspace,
         )
 
@@ -94,7 +93,7 @@ class CodexMergemasterRunner:
         try:
             from band.adapters import CodexAdapter
             from band.adapters.codex import CodexAdapterConfig
-            from band.core.types import AdapterFeatures, Capability, Emit
+            from band.core.types import Capability, Emit
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "
@@ -110,16 +109,14 @@ class CodexMergemasterRunner:
             model=model,
             system_prompt=prompt,
             approval_policy="never",
-            approval_mode=None,
-            cwd=workspace,
+            approval_mode="auto_accept",
+            cwd=workspace or os.getcwd(),
             sandbox="danger-full-access",
         )
         self._adapter = CodexAdapter(
             config=config,
-            features=AdapterFeatures(
-                capabilities={Capability.MEMORY},
-                emit={Emit.EXECUTION, Emit.TASK_EVENTS},
-            ),
+            capabilities={Capability.MEMORY},
+            emit={Emit.TOOL_CALLS, Emit.TASK_EVENTS},
         )
 
     @property

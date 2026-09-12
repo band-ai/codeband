@@ -61,7 +61,7 @@ class ClaudeConductorRunner:
         identity_section: str | None = None,
     ):
         from band.adapters import ClaudeSDKAdapter
-        from band.core.types import AdapterFeatures, Capability, Emit
+        from band.core.types import Capability, Emit
 
         prompt = _compose_prompt(
             custom_prompt, worker_roster, auto_merge, repo_pin, identity_section,
@@ -76,10 +76,8 @@ class ClaudeConductorRunner:
             custom_section=prompt,
             permission_mode="dontAsk",  # type: ignore[arg-type]
             approval_mode=None,
-            features=AdapterFeatures(
-                emit={Emit.EXECUTION, Emit.THOUGHTS},
-                capabilities={Capability.MEMORY},
-            ),
+            emit={Emit.TOOL_CALLS, Emit.THOUGHTS},
+            capabilities={Capability.MEMORY},
         )
 
     @property
@@ -110,7 +108,7 @@ class CodexConductorRunner:
         try:
             from band.adapters import CodexAdapter
             from band.adapters.codex import CodexAdapterConfig
-            from band.core.types import AdapterFeatures, Capability, Emit
+            from band.core.types import Capability, Emit
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "
@@ -129,16 +127,14 @@ class CodexConductorRunner:
             model=model,
             system_prompt=prompt,
             approval_policy="never",
-            approval_mode=None,
+            approval_mode="auto_decline",
             cwd=self._scratch_dir.name,
             sandbox="read-only",
         )
         self._adapter = CodexAdapter(
             config=config,
-            features=AdapterFeatures(
-                capabilities={Capability.MEMORY},
-                emit={Emit.EXECUTION, Emit.TASK_EVENTS},
-            ),
+            capabilities={Capability.MEMORY},
+            emit={Emit.TOOL_CALLS, Emit.TASK_EVENTS},
         )
 
     @property

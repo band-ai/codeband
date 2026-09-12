@@ -11,6 +11,19 @@
 
 **Adversarial multi-model coding agents via [Band.ai](https://band.ai).**
 
+> **Status: maintenance only.** Codeband is not actively developed. It is kept
+> working against the current Band.ai SDK, and bug reports are still welcome,
+> but no new features are planned.
+>
+> **If you are starting something new, use [Jam](https://docs.band.ai/jam)
+> instead.** Jam connects the coding agent you already run (Claude Code, and
+> other agents via MCP) to Band, so agents coordinate with each other and with
+> you in shared rooms. It covers the part of Codeband that mattered most —
+> getting agents to work together — without asking you to adopt Codeband's
+> orchestrator, config, or worktree layout. Install it with
+> `brew install thenvoi/tap/jam`, or get the desktop app from the
+> [Jam docs](https://docs.band.ai/jam).
+
 Codeband runs Claude Code and Codex in adversarial roles on the same repository: one model family writes code, the other reviews it before merge. The same pattern applies to planning: one model decomposes the task, the other validates the plan. The goal is to catch blind spots that same-model review can miss, while keeping every worker isolated in its own git worktree.
 
 It is built for headless operation: local terminals, Linux servers, CI, Docker, and distributed cloud workers.

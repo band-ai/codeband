@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from codeband.models import CLAUDE_SONNET, CODEX_GPT
@@ -47,7 +48,7 @@ class ClaudePlannerRunner:
         identity_section: str | None = None,
     ):
         from band.adapters import ClaudeSDKAdapter
-        from band.core.types import AdapterFeatures, Capability, Emit
+        from band.core.types import Capability, Emit
 
         prompt = _build_prompt(custom_prompt, worker_roster, identity_section)
 
@@ -62,10 +63,8 @@ class ClaudePlannerRunner:
             custom_section=prompt,
             permission_mode="dontAsk",  # type: ignore[arg-type]
             approval_mode=None,
-            features=AdapterFeatures(
-                emit={Emit.EXECUTION, Emit.THOUGHTS},
-                capabilities={Capability.MEMORY},
-            ),
+            emit={Emit.TOOL_CALLS, Emit.THOUGHTS},
+            capabilities={Capability.MEMORY},
             cwd=workspace,
         )
 
@@ -96,6 +95,7 @@ class CodexPlannerRunner:
         try:
             from band.adapters import CodexAdapter
             from band.adapters.codex import CodexAdapterConfig
+            from band.core.types import Capability, Emit
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "
@@ -108,11 +108,15 @@ class CodexPlannerRunner:
             model=model,
             system_prompt=prompt,
             approval_policy="never",
-            approval_mode=None,
-            cwd=workspace,
+            approval_mode="auto_decline",
+            cwd=workspace or os.getcwd(),
             sandbox="read-only",
         )
-        self._adapter = CodexAdapter(config=config)
+        self._adapter = CodexAdapter(
+            config=config,
+            emit={Emit.TOOL_CALLS, Emit.THOUGHTS},
+            capabilities={Capability.MEMORY},
+        )
 
     @property
     def adapter(self):

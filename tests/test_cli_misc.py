@@ -106,7 +106,7 @@ class TestFeedBannerAndHistory:
         return captured
 
     def test_live_mode_banner_on_stderr_only(self, _patched_feed):
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
         result = runner.invoke(cli, ["feed"])
         assert result.exit_code == 0
         assert "Live feed" in result.stderr
@@ -116,14 +116,14 @@ class TestFeedBannerAndHistory:
         assert _patched_feed["show_history"] is False
 
     def test_history_flag_enables_replay(self, _patched_feed):
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
         result = runner.invoke(cli, ["feed", "--history"])
         assert result.exit_code == 0
         assert "replaying history" in result.stderr
         assert _patched_feed["show_history"] is True
 
     def test_history_short_flag(self, _patched_feed):
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
         result = runner.invoke(cli, ["feed", "-H"])
         assert result.exit_code == 0
         assert _patched_feed["show_history"] is True

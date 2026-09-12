@@ -394,8 +394,8 @@ class TestWatchdogDaemon:
         """
         import logging
 
-        from thenvoi_rest.errors.not_found_error import NotFoundError
-        from thenvoi_rest.types.error import Error, ErrorError
+        from band.client.rest import NotFoundError
+        from band_rest.types.error import Error, ErrorError
 
         from codeband.agents.watchdog import WatchdogDaemon
 
@@ -453,8 +453,8 @@ class TestWatchdogDaemon:
         """The stale-room warning fires once per room, not on every patrol cycle."""
         import logging
 
-        from thenvoi_rest.errors.not_found_error import NotFoundError
-        from thenvoi_rest.types.error import Error, ErrorError
+        from band.client.rest import NotFoundError
+        from band_rest.types.error import Error, ErrorError
 
         from codeband.agents.watchdog import WatchdogDaemon
 
@@ -504,7 +504,7 @@ class TestWatchdogDaemon:
         """
         import logging
 
-        from thenvoi_rest.core.api_error import ApiError
+        from band_rest.core.api_error import ApiError
 
         from codeband.agents.watchdog import WatchdogDaemon
 
@@ -559,7 +559,7 @@ class TestWatchdogDaemon:
         """A 429 on the top-level list_chats call aborts the cycle with a warning."""
         import logging
 
-        from thenvoi_rest.core.api_error import ApiError
+        from band_rest.core.api_error import ApiError
 
         from codeband.agents.watchdog import WatchdogDaemon
 

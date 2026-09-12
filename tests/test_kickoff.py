@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 
+import band.client.rest
 import pytest
 
 from codeband.orchestration.kickoff import (
@@ -365,13 +366,12 @@ class TestSendTask:
 
         with patch.dict(os.environ, {"BAND_API_KEY": "human-key"}):
             # Patch at the source module level so the deferred import picks it up
-            import thenvoi_rest
-            original = thenvoi_rest.AsyncRestClient
-            thenvoi_rest.AsyncRestClient = factory
+            original = band.client.rest.AsyncRestClient
+            band.client.rest.AsyncRestClient = factory
             try:
                 await kickoff.send_task(sample_config, tmp_path, "implement feature X")
             finally:
-                thenvoi_rest.AsyncRestClient = original
+                band.client.rest.AsyncRestClient = original
 
         # Human created the room
         human_client.human_api_chats.create_my_chat_room.assert_called_once()
@@ -422,13 +422,12 @@ class TestSendTask:
         })
 
         with patch.dict(os.environ, {"BAND_API_KEY": "human-key"}):
-            import thenvoi_rest
-            original = thenvoi_rest.AsyncRestClient
-            thenvoi_rest.AsyncRestClient = factory
+            original = band.client.rest.AsyncRestClient
+            band.client.rest.AsyncRestClient = factory
             try:
                 await kickoff.send_task(sample_config, tmp_path, "add logging")
             finally:
-                thenvoi_rest.AsyncRestClient = original
+                band.client.rest.AsyncRestClient = original
 
         msg = human_client.human_api_messages.send_my_chat_message.call_args[1]["message"]
         assert "https://github.com/example/repo.git" in msg.content
@@ -453,14 +452,12 @@ class TestResetStaleRooms:
             creds.api_key: (creds.agent_id, key)
             for key, creds in sample_agent_config.agents.items()
         })
-
-        import thenvoi_rest
-        original = thenvoi_rest.AsyncRestClient
-        thenvoi_rest.AsyncRestClient = factory
+        original = band.client.rest.AsyncRestClient
+        band.client.rest.AsyncRestClient = factory
         try:
             result = await kickoff.reset_stale_rooms(sample_config, tmp_path)
         finally:
-            thenvoi_rest.AsyncRestClient = original
+            band.client.rest.AsyncRestClient = original
 
         assert result == []
 
@@ -477,14 +474,12 @@ class TestResetStaleRooms:
             for key, creds in sample_agent_config.agents.items()
         })
         factory("key-cond").agent_api_chats.list_agent_chats.side_effect = RuntimeError("boom")
-
-        import thenvoi_rest
-        original = thenvoi_rest.AsyncRestClient
-        thenvoi_rest.AsyncRestClient = factory
+        original = band.client.rest.AsyncRestClient
+        band.client.rest.AsyncRestClient = factory
         try:
             result = await kickoff.reset_stale_rooms(sample_config, tmp_path)
         finally:
-            thenvoi_rest.AsyncRestClient = original
+            band.client.rest.AsyncRestClient = original
 
         assert result == []
 
@@ -493,7 +488,7 @@ class TestResetStaleRooms:
         self, sample_config, sample_agent_config, tmp_path,
     ):
         """Stale rooms (participant read 404) lose all agents; live rooms are skipped."""
-        from thenvoi_rest.errors.not_found_error import NotFoundError
+        from band.client.rest import NotFoundError
 
         from codeband.orchestration import kickoff
 
@@ -517,14 +512,12 @@ class TestResetStaleRooms:
             return FakeListResponse(data=[])
 
         cond.agent_api_participants.list_agent_chat_participants.side_effect = participants
-
-        import thenvoi_rest
-        original = thenvoi_rest.AsyncRestClient
-        thenvoi_rest.AsyncRestClient = factory
+        original = band.client.rest.AsyncRestClient
+        band.client.rest.AsyncRestClient = factory
         try:
             result = await kickoff.reset_stale_rooms(sample_config, tmp_path)
         finally:
-            thenvoi_rest.AsyncRestClient = original
+            band.client.rest.AsyncRestClient = original
 
         assert result == ["stale-room"]
         assert not (tmp_path / ".codeband_room").exists()
